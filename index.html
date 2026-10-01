@@ -25,6 +25,7 @@
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   html, body { background: #0B0F17; color: #F5F7FA; margin: 0; }
   body { font-family: 'Plus Jakarta Sans', system-ui, sans-serif; -webkit-font-smoothing: antialiased; padding-bottom: env(safe-area-inset-bottom, 0px); }
@@ -63,7 +64,7 @@
 <script type="module">
 import { html, render, useState, useEffect, useRef, useMemo } from "https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js";
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut, signInWithCredential } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager,
   collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, getDoc, getDocs, query, where, writeBatch
@@ -80,6 +81,9 @@ const firebaseConfig = {
 };
 // Harus sama dengan daftar email di aturan keamanan Firestore (firestore.rules)
 const ALLOWED_EMAILS = ["ibrahimazzukhruf55@gmail.com", "mountjavva@gmail.com"];
+
+// Client ID OAuth (publik, bukan rahasia). Dipakai untuk tombol "Masuk dengan Google" langsung di halaman.
+const GOOGLE_CLIENT_ID = "797852641409-uhtmusih9qttbnkfmqec9crp9i9vc3ja.apps.googleusercontent.com";
 
 const fbApp = initializeApp(firebaseConfig);
 const auth = getAuth(fbApp);
@@ -1419,6 +1423,9 @@ const explainAuthError = (e) => {
       return "";
     case "auth/network-request-failed":
       return "Koneksi internet bermasalah. Coba lagi.";
+    case "auth/invalid-credential":
+    case "auth/invalid-oauth-client-id":
+      return "Google menolak kredensial login. Periksa Client ID di dalam file dan pastikan Authorized JavaScript origins di Google Cloud sudah berisi alamat aplikasi ini.";
     case "auth/operation-not-allowed":
       return "Login Google belum diaktifkan di Firebase Authentication.";
     default:
@@ -1429,7 +1436,37 @@ const explainAuthError = (e) => {
 const Login = ({ denied }) => {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
-  const signIn = async () => {
+  const [gsi, setGsi] = useState("loading");
+  const box = useRef(null);
+
+  const onCredential = async (resp) => {
+    setBusy(true); setErr("");
+    try { await signInWithCredential(auth, GoogleAuthProvider.credential(resp.credential)); }
+    catch (e) { setErr(explainAuthError(e)); setBusy(false); }
+  };
+
+  useEffect(() => {
+    if (denied) return;
+    let tries = 0, timer;
+    const init = () => {
+      const g = window.google && window.google.accounts && window.google.accounts.id;
+      if (g && box.current) {
+        try {
+          g.initialize({ client_id: GOOGLE_CLIENT_ID, callback: onCredential, auto_select: false });
+          const w = Math.max(200, Math.min(400, box.current.clientWidth || 320));
+          g.renderButton(box.current, { type: "standard", theme: "filled_blue", size: "large", text: "signin_with", shape: "rectangular", logo_alignment: "left", width: w, locale: "id" });
+          setGsi("ready");
+        } catch (e) { setGsi("failed"); }
+        return;
+      }
+      if (++tries > 40) { setGsi("failed"); return; }
+      timer = setTimeout(init, 250);
+    };
+    init();
+    return () => clearTimeout(timer);
+  }, [denied]);
+
+  const signInPopup = async () => {
     setBusy(true); setErr("");
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: "select_account" });
@@ -1441,6 +1478,7 @@ const Login = ({ denied }) => {
       setErr(explainAuthError(e)); setBusy(false);
     }
   };
+
   return html`<div class="min-h-screen flex items-center justify-center bg-[#0B0F17] px-4">
     <div class="w-full max-w-md fade-up">
       <div class="bg-[#161B26] border border-[#262F40] rounded-xl p-8 shadow-2xl">
@@ -1456,10 +1494,13 @@ const Login = ({ denied }) => {
         ${denied && html`<div class="mb-4 rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-200">Akun ${denied} tidak diizinkan memakai aplikasi ini. Keluar lalu masuk dengan akun yang terdaftar.</div>`}
         ${denied
           ? html`<${Btn} onClick=${() => signOut(auth)} cls="w-full !h-12">Keluar<//>`
-          : html`<button onClick=${signIn} disabled=${busy} class="w-full h-12 rounded-md bg-white text-slate-900 hover:bg-slate-100 font-semibold text-sm flex items-center justify-center gap-3 disabled:opacity-60">
-              ${busy ? html`<${Spinner} cls="w-5 h-5" />` : html`<svg class="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>`}
-              Masuk dengan Google
-            </button>`}
+          : html`<div>
+              <div ref=${box} class="flex justify-center min-h-[44px]"></div>
+              ${gsi === "loading" && html`<p class="text-xs text-muted-foreground text-center mt-2 flex items-center justify-center gap-2"><${Spinner} /> Memuat tombol Google...</p>`}
+              ${gsi === "failed" && html`<p class="text-xs text-amber-300 mt-2">Tombol Google gagal dimuat. Coba muat ulang halaman, atau pakai cara lain di bawah.</p>`}
+              ${busy && html`<p class="text-sm text-sky-300 text-center mt-3 flex items-center justify-center gap-2"><${Spinner} /> Memproses login...</p>`}
+              <button onClick=${signInPopup} disabled=${busy} class="mt-5 w-full text-xs text-muted-foreground underline hover:text-white disabled:opacity-50">Cara lain: masuk lewat jendela pop-up</button>
+            </div>`}
         ${err && html`<p class="mt-4 text-sm text-rose-300">${err}</p>`}
       </div>
     </div>
