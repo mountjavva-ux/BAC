@@ -89,10 +89,11 @@ const fbApp = initializeApp(firebaseConfig);
 const auth = getAuth(fbApp);
 let db;
 try {
-  db = initializeFirestore(fbApp, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
+  db = initializeFirestore(fbApp, { experimentalAutoDetectLongPolling: true });
 } catch (e) {
   db = getFirestore(fbApp);
 }
+const withTimeout = (p, ms, code) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej({ code }), ms))]);
 
 /* ======================= LOGIKA MURNI ======================= */
 // <PURE>
@@ -1423,6 +1424,8 @@ const explainAuthError = (e) => {
       return "";
     case "auth/network-request-failed":
       return "Koneksi internet bermasalah. Coba lagi.";
+    case "auth/timeout":
+      return "Firebase tidak merespons dalam 25 detik. Periksa sinyal internet, matikan VPN atau pemblokir iklan, lalu coba lagi.";
     case "auth/invalid-credential":
     case "auth/invalid-oauth-client-id":
       return "Google menolak kredensial login. Periksa Client ID di dalam file dan pastikan Authorized JavaScript origins di Google Cloud sudah berisi alamat aplikasi ini.";
@@ -1437,12 +1440,15 @@ const Login = ({ denied }) => {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [gsi, setGsi] = useState("loading");
+  const [step, setStep] = useState("");
   const box = useRef(null);
 
   const onCredential = async (resp) => {
-    setBusy(true); setErr("");
-    try { await signInWithCredential(auth, GoogleAuthProvider.credential(resp.credential)); }
-    catch (e) { setErr(explainAuthError(e)); setBusy(false); }
+    setBusy(true); setErr(""); setStep("Google menerima login. Menghubungi Firebase...");
+    try {
+      await withTimeout(signInWithCredential(auth, GoogleAuthProvider.credential(resp.credential)), 25000, "auth/timeout");
+      setStep("Login berhasil. Membuka aplikasi...");
+    } catch (e) { setErr(explainAuthError(e)); setBusy(false); setStep(""); }
   };
 
   useEffect(() => {
@@ -1498,11 +1504,12 @@ const Login = ({ denied }) => {
               <div ref=${box} class="flex justify-center min-h-[44px]"></div>
               ${gsi === "loading" && html`<p class="text-xs text-muted-foreground text-center mt-2 flex items-center justify-center gap-2"><${Spinner} /> Memuat tombol Google...</p>`}
               ${gsi === "failed" && html`<p class="text-xs text-amber-300 mt-2">Tombol Google gagal dimuat. Coba muat ulang halaman, atau pakai cara lain di bawah.</p>`}
-              ${busy && html`<p class="text-sm text-sky-300 text-center mt-3 flex items-center justify-center gap-2"><${Spinner} /> Memproses login...</p>`}
+              ${(busy || step) && html`<p class="text-sm text-sky-300 text-center mt-3 flex items-center justify-center gap-2"><${Spinner} /> ${step || "Memproses login..."}</p>`}
               <button onClick=${signInPopup} disabled=${busy} class="mt-5 w-full text-xs text-muted-foreground underline hover:text-white disabled:opacity-50">Cara lain: masuk lewat jendela pop-up</button>
             </div>`}
         ${err && html`<p class="mt-4 text-sm text-rose-300">${err}</p>`}
       </div>
+      <p class="mt-4 text-[10px] text-muted-foreground text-center font-mono">Versi 3</p>
     </div>
   </div>`;
 };
@@ -1523,6 +1530,23 @@ const LoadError = ({ code }) => html`<div class="min-h-screen flex items-center 
   </div>
 </div>`;
 
+const LoadingData = ({ waiting }) => {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setSlow(true), 12000); return () => clearTimeout(t); }, []);
+  return html`<div class="min-h-screen flex flex-col items-center justify-center gap-3 bg-[#0B0F17] px-6 text-center">
+    <div class="text-sky-400"><${Spinner} cls="w-8 h-8" /></div>
+    <p class="text-sm text-muted-foreground">Memuat data...</p>
+    ${slow && html`<div class="max-w-sm rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-left">
+      <p class="text-sm text-amber-200 mb-2">Terlalu lama. Masih menunggu: <span class="font-mono">${waiting.join(", ")}</span></p>
+      <p class="text-xs text-slate-300 mb-3">Koneksi perangkat: ${navigator.onLine ? "online" : "offline"}. Coba pindah antara Wi-Fi dan data seluler, atau matikan VPN dan pemblokir iklan.</p>
+      <div class="flex gap-2">
+        <${Btn} onClick=${() => location.reload()}>Muat ulang<//>
+        <${Btn} variant="outline" onClick=${() => signOut(auth)}>Keluar<//>
+      </div>
+    </div>`}
+  </div>`;
+};
+
 const readPage = () => {
   const p = (location.hash || "").replace(/^#\/?/, "");
   return NAV.some((n) => n.to === p) ? p : "dashboard";
@@ -1533,6 +1557,7 @@ const App = () => {
   const [page, setPage] = useState(readPage());
   const [data, setData] = useState({ skus: [], cash: [], orders: [], settings: {}, ready: false });
   const [loadErr, setLoadErr] = useState("");
+  const [waiting, setWaiting] = useState(["skus", "cash", "orders", "settings"]);
 
   useEffect(() => onAuthStateChanged(auth, (u) => setUser(u)), []);
   useEffect(() => {
@@ -1546,8 +1571,8 @@ const App = () => {
 
   useEffect(() => {
     if (!allowed) return;
-    const loaded = {};
-    const mark = (k) => { loaded[k] = true; if (Object.keys(loaded).length === 4) setData((x) => ({ ...x, ready: true })); };
+    setWaiting(["skus", "cash", "orders", "settings"]);
+    const mark = (k) => setWaiting((w) => w.filter((x) => x !== k));
     const onErr = (e) => { console.error(e); setLoadErr(e.code || e.message || "unknown"); };
     const un = [
       onSnapshot(collection(db, "skus"), (s) => {
@@ -1568,7 +1593,7 @@ const App = () => {
   if (!user) return html`<${Login} />`;
   if (!allowed) return html`<${Login} denied=${user.email} />`;
   if (loadErr) return html`<${LoadError} code=${loadErr} />`;
-  if (!data.ready) return html`<${FullSpinner} text="Memuat data..." />`;
+  if (waiting.length) return html`<${LoadingData} waiting=${waiting} />`;
 
   const d = { ...data, actor: user.displayName || user.email };
   const body = page === "dashboard" ? html`<${Dashboard} d=${d} />`
