@@ -99,6 +99,7 @@ const firebaseConfig = {
 };
 // Harus sama dengan daftar email di aturan keamanan Firestore (firestore.rules)
 const ALLOWED_EMAILS = ["ibrahimazzukhruf55@gmail.com", "mountjavva@gmail.com"];
+const emailOf = (u) => String((u && (u.email || ((u.providerData || []).find((p) => p && p.email) || {}).email)) || "").toLowerCase();
 
 // Client ID OAuth (publik, bukan rahasia). Dipakai untuk tombol "Masuk dengan Google" langsung di halaman.
 const GOOGLE_CLIENT_ID = "797852641409-uhtmusih9qttbnkfmqec9crp9i9vc3ja.apps.googleusercontent.com";
@@ -637,10 +638,10 @@ const Layout = ({ page, user, skus, children }) => {
       </nav>
       <div class="p-3 border-t border-[#1c2434]">
         <div class="flex items-center gap-3 px-2 py-2">
-          <div class="w-8 h-8 rounded-full bg-sky-500/20 flex items-center justify-center text-xs font-semibold text-sky-300">${(user.displayName || user.email || "B")[0].toUpperCase()}</div>
+          <div class="w-8 h-8 rounded-full bg-sky-500/20 flex items-center justify-center text-xs font-semibold text-sky-300">${(user.displayName || emailOf(user) || "B")[0].toUpperCase()}</div>
           <div class="min-w-0 flex-1">
             <p class="text-xs font-medium truncate">${user.displayName || "BAC"}</p>
-            <p class="text-[10px] text-muted-foreground truncate">${user.email}</p>
+            <p class="text-[10px] text-muted-foreground truncate">${emailOf(user)}</p>
           </div>
           <button onClick=${() => signOut(auth)} class="text-muted-foreground hover:text-rose-400" aria-label="Keluar"><${Icon} name="logout" cls="w-4 h-4" /></button>
         </div>
@@ -1413,7 +1414,7 @@ const SettingsPage = ({ d, user }) => {
     <div class="bg-[#161B26] border border-[#262F40] rounded-lg p-5">
       <p class="text-xs text-muted-foreground mb-1">Masuk sebagai</p>
       <p class="font-medium">${user.displayName || "BAC"}</p>
-      <p class="text-sm text-muted-foreground mb-4 break-all">${user.email}</p>
+      <p class="text-sm text-muted-foreground mb-4 break-all">${emailOf(user) || "UID: " + user.uid}</p>
       <${Btn} variant="outline" onClick=${() => signOut(auth)}><${Icon} name="logout" /> Keluar<//>
     </div>
 
@@ -1533,30 +1534,43 @@ const Login = ({ denied }) => {
         ${err && html`<p class="mt-4 text-sm text-rose-300">${err}</p>`}
         ${stuck && html`<div class="mt-4 rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
           <p class="text-sm text-amber-200 mb-1">Login sudah berhasil tetapi aplikasi belum terbuka.</p>
-          <p class="text-xs text-slate-300 font-mono mb-3 break-all">Akun terdeteksi: ${auth.currentUser ? auth.currentUser.email : "tidak ada"}</p>
+          <p class="text-xs text-slate-300 font-mono mb-3 break-all">Akun terdeteksi: ${auth.currentUser ? (emailOf(auth.currentUser) || "UID " + auth.currentUser.uid) : "tidak ada"}</p>
           <${Btn} onClick=${() => location.reload()} cls="w-full">Muat ulang halaman<//>
         </div>`}
       </div>
-      <p class="mt-4 text-[10px] text-muted-foreground text-center font-mono">Versi 4</p>
+      <p class="mt-4 text-[10px] text-muted-foreground text-center font-mono">Versi 5</p>
     </div>
   </div>`;
 };
 
 const FullSpinner = ({ text }) => html`<div class="min-h-screen flex flex-col items-center justify-center gap-3 bg-[#0B0F17] text-sky-400"><${Spinner} cls="w-8 h-8" />${text && html`<p class="text-sm text-muted-foreground">${text}</p>`}</div>`;
 
-const LoadError = ({ code }) => html`<div class="min-h-screen flex items-center justify-center bg-[#0B0F17] px-4">
-  <div class="w-full max-w-md bg-[#161B26] border border-rose-500/40 rounded-xl p-6">
-    <h2 class="text-lg font-bold mb-2">Data belum bisa dibuka</h2>
-    <p class="text-sm text-slate-300 mb-3">${code === "permission-denied"
-      ? "Aturan keamanan Firestore belum dipasang, atau email Anda belum ada di daftar aturan. Buka Firebase > Firestore Database > Rules, tempel isi file firestore.rules, lalu tekan Publish."
-      : "Terjadi gangguan saat memuat data. Periksa internet lalu muat ulang."}</p>
-    <p class="text-xs text-muted-foreground font-mono mb-4 break-all">Kode: ${code}</p>
-    <div class="flex gap-2">
-      <${Btn} onClick=${() => location.reload()}>Muat ulang<//>
-      <${Btn} variant="outline" onClick=${() => signOut(auth)}>Keluar<//>
+const LoadError = ({ code, user }) => {
+  const denied = code === "permission-denied";
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(user.uid); toast("UID disalin"); }
+    catch (e) { toast("Tekan lama UID lalu pilih Salin", "info"); }
+  };
+  return html`<div class="min-h-screen flex items-center justify-center bg-[#0B0F17] px-4">
+    <div class="w-full max-w-md bg-[#161B26] border border-rose-500/40 rounded-xl p-6">
+      <h2 class="text-lg font-bold mb-2">Data belum bisa dibuka</h2>
+      ${denied
+        ? html`<div>
+            <p class="text-sm text-slate-300 mb-3">Login berhasil, tetapi aturan keamanan Firestore belum mengenali akun ini. Daftarkan UID di bawah pada aturan Firestore, lalu tekan Publish.</p>
+            <p class="text-[11px] text-muted-foreground mb-1">UID akun</p>
+            <p class="font-mono text-sm break-all select-all bg-[#0B0F17] border border-[#262F40] rounded-md p-3 mb-2">${user.uid}</p>
+            <p class="text-[11px] text-muted-foreground mb-3">Email: ${emailOf(user) || "(tidak tersedia)"}</p>
+            <${Btn} variant="outline" onClick=${copy} cls="w-full mb-3">Salin UID<//>
+          </div>`
+        : html`<p class="text-sm text-slate-300 mb-3">Terjadi gangguan saat memuat data. Periksa internet lalu muat ulang.</p>`}
+      <p class="text-xs text-muted-foreground font-mono mb-4 break-all">Kode: ${code}</p>
+      <div class="flex gap-2">
+        <${Btn} onClick=${() => location.reload()}>Muat ulang<//>
+        <${Btn} variant="outline" onClick=${() => signOut(auth)}>Keluar<//>
+      </div>
     </div>
-  </div>
-</div>`;
+  </div>`;
+};
 
 const ErrorBoundary = PZ.Component ? class extends PZ.Component {
   componentDidCatch(e) { console.error(e); this.setState({ err: e }); }
@@ -1616,8 +1630,8 @@ const App = () => {
     return () => window.removeEventListener("hashchange", h);
   }, []);
 
-  const email = user ? String(user.email || "").toLowerCase() : "";
-  const allowed = !!user && ALLOWED_EMAILS.includes(email);
+  const email = emailOf(user);
+  const allowed = !!user && (email ? ALLOWED_EMAILS.includes(email) : true);
 
   useEffect(() => {
     if (!allowed) return;
@@ -1641,11 +1655,11 @@ const App = () => {
 
   if (user === undefined) return html`<${FullSpinner} />`;
   if (!user) return html`<${Login} />`;
-  if (!allowed) return html`<${Login} denied=${user.email} />`;
-  if (loadErr) return html`<${LoadError} code=${loadErr} />`;
+  if (!allowed) return html`<${Login} denied=${email} />`;
+  if (loadErr) return html`<${LoadError} code=${loadErr} user=${user} />`;
   if (waiting.length) return html`<${LoadingData} waiting=${waiting} />`;
 
-  const d = { ...data, actor: user.displayName || user.email };
+  const d = { ...data, actor: user.displayName || email || "BAC" };
   const body = page === "dashboard" ? html`<${Dashboard} d=${d} />`
     : page === "inventory" ? html`<${Inventory} d=${d} />`
     : page === "shopee" ? html`<${Shopee} d=${d} />`
