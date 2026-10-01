@@ -61,7 +61,25 @@
   }, 15000);
 </script>
 
+<script>
+  (function () {
+    function show(msg) {
+      if (/ResizeObserver/.test(msg)) return;
+      var d = document.getElementById("errbar");
+      if (!d) {
+        d = document.createElement("div"); d.id = "errbar";
+        d.style.cssText = "position:fixed;left:8px;right:8px;bottom:8px;z-index:100;background:#7f1d1d;color:#fff;font:12px/1.4 monospace;padding:10px 12px;border-radius:8px;white-space:pre-wrap;word-break:break-word;max-height:40vh;overflow:auto";
+        document.body.appendChild(d);
+      }
+      d.textContent = "Galat: " + msg + "  (ketuk untuk menutup)";
+      d.onclick = function () { d.remove(); };
+    }
+    window.addEventListener("error", function (e) { show(String(e.message || e.error || "tidak diketahui")); });
+    window.addEventListener("unhandledrejection", function (e) { var r = e.reason; show(String((r && (r.code || r.message)) || r)); });
+  })();
+</script>
 <script type="module">
+import * as PZ from "https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js";
 import { html, render, useState, useEffect, useRef, useMemo } from "https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js";
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut, signInWithCredential } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
@@ -1441,13 +1459,18 @@ const Login = ({ denied }) => {
   const [busy, setBusy] = useState(false);
   const [gsi, setGsi] = useState("loading");
   const [step, setStep] = useState("");
+  const [stuck, setStuck] = useState(false);
+  const alive = useRef(true);
   const box = useRef(null);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
   const onCredential = async (resp) => {
     setBusy(true); setErr(""); setStep("Google menerima login. Menghubungi Firebase...");
     try {
       await withTimeout(signInWithCredential(auth, GoogleAuthProvider.credential(resp.credential)), 25000, "auth/timeout");
       setStep("Login berhasil. Membuka aplikasi...");
+      window.dispatchEvent(new Event("bac-auth"));
+      setTimeout(() => { if (alive.current) setStuck(true); }, 6000);
     } catch (e) { setErr(explainAuthError(e)); setBusy(false); setStep(""); }
   };
 
@@ -1508,8 +1531,13 @@ const Login = ({ denied }) => {
               <button onClick=${signInPopup} disabled=${busy} class="mt-5 w-full text-xs text-muted-foreground underline hover:text-white disabled:opacity-50">Cara lain: masuk lewat jendela pop-up</button>
             </div>`}
         ${err && html`<p class="mt-4 text-sm text-rose-300">${err}</p>`}
+        ${stuck && html`<div class="mt-4 rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+          <p class="text-sm text-amber-200 mb-1">Login sudah berhasil tetapi aplikasi belum terbuka.</p>
+          <p class="text-xs text-slate-300 font-mono mb-3 break-all">Akun terdeteksi: ${auth.currentUser ? auth.currentUser.email : "tidak ada"}</p>
+          <${Btn} onClick=${() => location.reload()} cls="w-full">Muat ulang halaman<//>
+        </div>`}
       </div>
-      <p class="mt-4 text-[10px] text-muted-foreground text-center font-mono">Versi 3</p>
+      <p class="mt-4 text-[10px] text-muted-foreground text-center font-mono">Versi 4</p>
     </div>
   </div>`;
 };
@@ -1529,6 +1557,23 @@ const LoadError = ({ code }) => html`<div class="min-h-screen flex items-center 
     </div>
   </div>
 </div>`;
+
+const ErrorBoundary = PZ.Component ? class extends PZ.Component {
+  componentDidCatch(e) { console.error(e); this.setState({ err: e }); }
+  render() {
+    if (this.state && this.state.err) {
+      const e = this.state.err;
+      return html`<div class="min-h-screen flex items-center justify-center bg-[#0B0F17] px-4">
+        <div class="w-full max-w-md bg-[#161B26] border border-rose-500/40 rounded-xl p-6">
+          <h2 class="text-lg font-bold mb-2">Terjadi galat di aplikasi</h2>
+          <p class="text-xs text-rose-200 font-mono mb-4 break-words whitespace-pre-wrap">${String((e && (e.stack || e.message)) || e).slice(0, 600)}</p>
+          <${Btn} onClick=${() => location.reload()}>Muat ulang<//>
+        </div>
+      </div>`;
+    }
+    return this.props.children;
+  }
+} : ({ children }) => children;
 
 const LoadingData = ({ waiting }) => {
   const [slow, setSlow] = useState(false);
@@ -1559,7 +1604,12 @@ const App = () => {
   const [loadErr, setLoadErr] = useState("");
   const [waiting, setWaiting] = useState(["skus", "cash", "orders", "settings"]);
 
-  useEffect(() => onAuthStateChanged(auth, (u) => setUser(u)), []);
+  useEffect(() => {
+    const un = onAuthStateChanged(auth, (u) => setUser(u));
+    const sync = () => setUser(auth.currentUser);
+    window.addEventListener("bac-auth", sync);
+    return () => { un(); window.removeEventListener("bac-auth", sync); };
+  }, []);
   useEffect(() => {
     const h = () => { setPage(readPage()); window.scrollTo(0, 0); };
     window.addEventListener("hashchange", h);
@@ -1609,7 +1659,7 @@ if (window.Chart) {
   window.Chart.defaults.borderColor = "#262F40";
   window.Chart.defaults.font.family = "'Plus Jakarta Sans', sans-serif";
 }
-render(html`<${App} /><${Toaster} />`, document.getElementById("app"));
+render(html`<${ErrorBoundary}><${App} /><//><${Toaster} />`, document.getElementById("app"));
 const boot = document.getElementById("boot");
 if (boot) boot.remove();
 </script>
