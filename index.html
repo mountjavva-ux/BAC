@@ -99,6 +99,7 @@ const firebaseConfig = {
 };
 // Harus sama dengan daftar email di aturan keamanan Firestore (firestore.rules)
 const ALLOWED_EMAILS = ["ibrahimazzukhruf55@gmail.com", "mountjavva@gmail.com"];
+const APP_VERSION = 6;
 const emailOf = (u) => String((u && (u.email || ((u.providerData || []).find((p) => p && p.email) || {}).email)) || "").toLowerCase();
 
 // Client ID OAuth (publik, bukan rahasia). Dipakai untuk tombol "Masuk dengan Google" langsung di halaman.
@@ -188,7 +189,15 @@ const computeDashboard = ({ skus, cash, orders, settings, start, end }) => {
     flow[d].pengeluaran += num(e.pengeluaran);
   }
   const nowMonth = todayStr().slice(0, 7);
+  const byCh = {};
+  for (const e of entries) {
+    const k = channelOfCash(e) || "Tanpa tag";
+    const r = (byCh[k] = byCh[k] || { channel: k, pemasukan: 0, pengeluaran: 0 });
+    r.pemasukan += num(e.pemasukan);
+    r.pengeluaran += num(e.pengeluaran);
+  }
   return {
+    by_channel: Object.values(byCh).sort((a, b) => b.pemasukan - a.pemasukan),
     saldo,
     bulan_ini: nowMonth,
     omzet_bulan_ini: sum(all.filter((e) => (e.date || "").slice(0, 7) === nowMonth), (e) => e.pemasukan),
@@ -199,8 +208,8 @@ const computeDashboard = ({ skus, cash, orders, settings, start, end }) => {
     stock_value: sum(skus, (s) => num(s.stock) * num(s.price)),
     critical_count: critical.length,
     critical_items: critical.slice(0, 5),
-    shopee_revenue: sum(ords, (o) => o.pendapatan_akhir),
-    shopee_belum_cair: sum(ords.filter((o) => !o.cair), (o) => o.pendapatan_akhir),
+    shopee_revenue: sum(ords.filter((o) => o.cair), (o) => o.pendapatan_akhir),
+    shopee_belum_cair: sum(ords.filter((o) => !o.cair && !isCancelled(o.status)), (o) => o.nilai),
     cash_flow: Object.values(flow).sort((a, b) => a.date.localeCompare(b.date)).slice(-14)
   };
 };
@@ -210,10 +219,10 @@ const computeMonthly = (cash) => {
   for (const e of cashSorted(cash)) {
     const m = (e.date || "").slice(0, 7);
     if (!m) continue;
-    const r = (rep[m] = rep[m] || { month: m, pemasukan: 0, pengeluaran: 0, shopee: 0 });
+    const r = (rep[m] = rep[m] || { month: m, pemasukan: 0, pengeluaran: 0, marketplace: 0 });
     r.pemasukan += num(e.pemasukan);
     r.pengeluaran += num(e.pengeluaran);
-    if (e.source === "Shopee Auto") r.shopee += num(e.pemasukan);
+    if (/ Auto$/.test(e.source || "")) r.marketplace += num(e.pemasukan);
   }
   return Object.values(rep).sort((a, b) => b.month.localeCompare(a.month)).map((r) => ({ ...r, net: r.pemasukan - r.pengeluaran }));
 };
@@ -234,7 +243,151 @@ const computeTopProducts = (orders, skus, month) => {
   return Object.values(agg).sort((a, b) => b.qty - a.qty).slice(0, 8);
 };
 
-const orderKey = (o) => `${o.order_no}|${o.shopee_title ?? o.product_name ?? ""}|${o.variation || ""}`;
+const CHANNELS = ["Shopee", "TikTok", "Lazada", "Offline", "Lainnya"];
+const chanOf = (o) => (o && o.channel) || "Shopee";
+const channelOfCash = (e) => e.channel || (e.source === "Shopee Auto" ? "Shopee" : "");
+// Kunci pesanan: channel + nomor pesanan + (ID item, atau judul + variasi)
+const orderKey = (o) => `${chanOf(o)}|${o.order_no}|${o.item_id ? "i" + o.item_id : `${o.shopee_title ?? o.product_name ?? ""}|${o.variation || ""}`}`;
+const groupKeyOf = (o) => `${chanOf(o)}|${o.order_no}`;
+const cashIdOfGroup = (o) => `kas_${chanOf(o).toLowerCase()}_${String(o.order_no).replace(/[^A-Za-z0-9_-]/g, "_")}`;
+// Bagi total rupiah ke beberapa baris menurut bobot, hasil bilangan bulat dan jumlahnya persis sama dengan total
+const splitAmount = (total, weights) => {
+  const n = weights.length;
+  if (!n) return [];
+  const t = Math.round(total);
+  const w = weights.map((x) => Math.max(0, num(x)));
+  const sw = w.reduce((a, b) => a + b, 0);
+  const raw = w.map((x) => (sw > 0 ? (t * x) / sw : t / n));
+  const base = raw.map((r) => Math.floor(r));
+  let rest = t - base.reduce((a, b) => a + b, 0);
+  const order = raw.map((r, i) => [r - Math.floor(r), i]).sort((a, b) => b[0] - a[0]);
+  for (let k = 0; k < order.length && rest > 0; k++, rest--) base[order[k][1]]++;
+  return base;
+};
+// Pesanan yang perlu dikoreksi: sudah ditandai cair tetapi angkanya estimasi (versi lama), atau dibatalkan setelah dicatat
+const needsFix = (o) => (!!o.cair && !o.kas_final) || (!!o.kas_final && isCancelled(o.status));
+const applySku = (it, skuId, skus) => {
+  const s = skus.find((x) => x.id === skuId);
+  return { ...it, sku_id: s ? s.id : null, sku_code: s ? s.code : null, sku_name: s ? s.name : null, manual: true };
+};
+
+// Angka: mengenali gaya Amerika (165,249.00 / 185000.00) maupun Indonesia (1.234,5)
+const parseMoneyAuto = (v) => {
+  if (typeof v === "number") return isFinite(v) ? v : 0;
+  let s = String(v ?? "").replace(/rp|idr|\s/gi, "");
+  if (!s || s === "-") return 0;
+  const neg = s.startsWith("-") || s.startsWith("(");
+  s = s.replace(/[^0-9,.]/g, "");
+  if (!s) return 0;
+  const hasDot = s.includes("."), hasComma = s.includes(",");
+  let out;
+  if (hasDot && hasComma) out = s.lastIndexOf(".") > s.lastIndexOf(",") ? s.replace(/,/g, "") : s.replace(/\./g, "").replace(",", ".");
+  else if (hasComma) out = /^\d{1,3}(,\d{3})+$/.test(s) ? s.replace(/,/g, "") : s.replace(",", ".");
+  else if (hasDot) out = /^\d{1,3}(\.\d{3})+$/.test(s) ? s.replace(/\./g, "") : s;
+  else out = s;
+  const f = parseFloat(out);
+  if (isNaN(f)) return 0;
+  return neg ? -f : f;
+};
+const LZD_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, mei: 5, jun: 6, jul: 7, aug: 8, agu: 8, agt: 8, sep: 9, oct: 10, okt: 10, nov: 11, dec: 12, des: 12 };
+// "17 Sep 2026 19:18" -> "2026-09-17"
+const parseLzdDate = (v) => {
+  if (!v) return "";
+  if (v instanceof Date) return `${v.getFullYear()}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}`;
+  const s = String(v);
+  const m = s.match(/(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})/);
+  if (m) { const mo = LZD_MONTHS[m[2].slice(0, 3).toLowerCase()]; return mo ? `${m[3]}-${pad(mo)}-${pad(Number(m[1]))}` : ""; }
+  const iso = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+  return iso ? `${iso[1]}-${iso[2]}-${iso[3]}` : "";
+};
+const mapLzdStatus = (raw) => {
+  const s = String(raw || "").toLowerCase();
+  if (!s) return "";
+  if (s.includes("cancel") || s.includes("batal")) return "Dibatalkan";
+  if (s.includes("return") || s.includes("refund")) return "Dikembalikan";
+  if (s.includes("fail")) return "Gagal Kirim";
+  if (s.includes("deliver") || s.includes("confirm") || s.includes("complet") || s.includes("selesai")) return "Selesai";
+  if (s.includes("ship") || s.includes("ready") || s.includes("pending") || s.includes("pack") || s.includes("proses")) return "Sedang Dikirim";
+  return String(raw).trim();
+};
+
+// Pratinjau laporan pesanan Lazada. Satu baris = satu unit barang. Nilai = harga - diskon penjual.
+const buildLazadaPreview = (rows, skus, cfg) => {
+  const cols = rows.length ? Object.keys(rows[0]) : [];
+  const col = (n) => cols.find((c) => String(c).trim().toLowerCase() === n.toLowerCase()) || null;
+  const cOrder = col("orderNumber"), cItem = col("orderItemId"), cStatus = col("status"), cName = col("itemName"),
+    cVar = col("variation"), cPrice = col("unitPrice"), cSeller = col("sellerDiscountTotal"),
+    cCreate = col("createTime"), cUpdate = col("updateTime"), cSku = col("sellerSku");
+  if (!cOrder || !cName || !cPrice) throw new Error("Format Lazada tidak dikenali. Pastikan file laporan pesanan Lazada (ada kolom orderNumber, itemName, unitPrice).");
+  const pct = num(cfg && cfg.pct), fixed = num(cfg && cfg.fixed);
+  const items = [];
+  for (const row of rows) {
+    const name = String(row[cName] ?? "").trim();
+    if (!name) continue;
+    let variation = cVar ? String(row[cVar] ?? "").trim() : "";
+    if (variation === "-") variation = "";
+    const mpSku = cSku ? String(row[cSku] ?? "").trim() : "";
+    const price = parseMoneyAuto(row[cPrice]);
+    const seller = cSeller ? Math.abs(parseMoneyAuto(row[cSeller])) : 0;
+    const nilai = Math.max(0, price - seller);
+    const status = mapLzdStatus(cStatus ? row[cStatus] : "");
+    const biaya = isCancelled(status) ? nilai : Math.round((nilai * pct) / 100 + (nilai > 0 ? fixed : 0));
+    const m = (mpSku && skus.find((s) => (s.mp_skus || []).includes(mpSku))) || matchSku(`${name} ${variation}`, skus);
+    items.push({
+      channel: "Lazada",
+      order_no: String(row[cOrder] ?? "").trim(),
+      item_id: cItem ? String(row[cItem] ?? "").trim() : "",
+      product_name: name, variation, mp_sku: mpSku, qty: 1, nilai, biaya,
+      pendapatan_akhir: nilai - biaya, status,
+      tanggal_kirim: cCreate ? parseLzdDate(row[cCreate]) : "",
+      tgl_update: cUpdate ? parseLzdDate(row[cUpdate]) : "",
+      sku_id: m ? m.id : null, sku_code: m ? m.code : null, sku_name: m ? m.name : null
+    });
+  }
+  return { items, total: items.length, matched: items.filter((i) => i.sku_id).length };
+};
+
+// Membaca tabel "Daftar Laporan Pendapatan" Lazada yang disalin-tempel
+const parsePayoutText = (text) => {
+  const t = String(text || "");
+  const re = /\b([A-Za-z0-9]+-\d{4}-\d{4})\b/g;
+  const marks = [];
+  let m;
+  while ((m = re.exec(t))) marks.push({ no: m[1], at: m.index });
+  return marks.map((mk, i) => {
+    const seg = t.slice(mk.at + mk.no.length, i + 1 < marks.length ? marks[i + 1].at : t.length);
+    const d = seg.match(/(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})/);
+    const a = seg.match(/(?:Rp|IDR)\s*(-?[\d.,]+)/i);
+    return { report_no: mk.no, date: d ? parseLzdDate(d[1]) : "", amount: a ? parseMoneyAuto(a[1]) : 0, released: /dilepas|released/i.test(seg) };
+  });
+};
+// Pasangkan pencairan dengan pesanan Lazada yang belum cair: nilai dulu, lalu tanggal. Yang ambigu tidak ditebak.
+const matchPayouts = (payouts, orders, tol = 100) => {
+  const pool = orders.filter((o) => chanOf(o) === "Lazada" && !o.cair && !isCancelled(o.status));
+  const taken = new Set();
+  const res = payouts.map((p) => {
+    if (!p.date || !(p.amount > 0)) return { p, status: "invalid", cands: [], pick: null };
+    if (!p.released) return { p, status: "notreleased", cands: [], pick: null };
+    if (orders.some((o) => o.payout_report && o.payout_report === p.report_no)) return { p, status: "already", cands: [], pick: null };
+    return { p, status: "open", cands: pool.filter((o) => Math.abs(num(o.pendapatan_akhir) - p.amount) <= tol), pick: null };
+  });
+  for (const r of res) {
+    if (r.status !== "open") continue;
+    const same = r.cands.filter((o) => !taken.has(o.id) && o.tgl_update === r.p.date);
+    if (same.length === 1) { r.pick = same[0]; r.status = "ready"; taken.add(same[0].id); }
+  }
+  for (const r of res) {
+    if (r.status !== "open") continue;
+    const avail = r.cands.filter((o) => !taken.has(o.id));
+    if (avail.length === 1) { r.pick = avail[0]; r.status = "ready"; r.dateDiff = true; taken.add(avail[0].id); }
+  }
+  for (const r of res) {
+    if (r.status !== "open") continue;
+    r.cands = r.cands.filter((o) => !taken.has(o.id));
+    r.status = r.cands.length ? "ambiguous" : "notfound";
+  }
+  return res;
+};
 
 // Ubah baris laporan Shopee (hasil baca file) menjadi daftar item pratinjau
 const buildPreview = (rows, skus, biayaPct) => {
@@ -339,33 +492,17 @@ async function createCash(p) {
   await setDoc(ref("cash", id), {
     id, date: p.date, pemasukan: num(p.pemasukan), ket_pemasukan: p.ket_pemasukan || "",
     pengeluaran: num(p.pengeluaran), ket_pengeluaran: p.ket_pengeluaran || "",
-    source: p.source || "Manual", ref: p.ref || "", created_at: nowIso()
+    source: p.source || "Manual", channel: p.channel || "", ref: p.ref || "", created_at: nowIso()
   });
 }
 async function deleteCash(id) { await deleteDoc(ref("cash", id)); }
 
 async function saveSettings(upd) { await setDoc(ref("settings", "global"), { id: "global", ...upd }, { merge: true }); }
 
-// Kas Shopee hanya dicatat saat pesanan sudah cair (masuk rekening)
-async function syncOrderCash(order) {
-  const cashId = "shopee_" + order.id;
-  const r = ref("cash", cashId);
-  const should = !!order.cair && num(order.pendapatan_akhir) > 0;
-  if (should) {
-    const data = {
-      id: cashId, date: order.tanggal_cair || todayStr(), pemasukan: num(order.pendapatan_akhir),
-      ket_pemasukan: `Shopee - ${order.order_no}`, pengeluaran: 0, ket_pengeluaran: "",
-      source: "Shopee Auto", ref: order.id
-    };
-    const snap = await getDoc(r);
-    if (snap.exists()) await updateDoc(r, data);
-    else await setDoc(r, { ...data, created_at: nowIso() });
-    return true;
-  }
-  await deleteDoc(r);
-  return false;
-}
-// Sinkronkan stok dan kas sesuai status pesanan. Aman dijalankan berulang (pakai deducted_qty)
+// ATURAN KAS: kas TIDAK pernah dibuat dari estimasi. Kas hanya lahir dari recordFinal,
+// yaitu angka akhir yang Anda masukkan dan verifikasi sendiri dari rincian pesanan marketplace.
+
+// Sinkronkan stok sesuai status pesanan. Aman dijalankan berulang (pakai deducted_qty)
 async function applyOrderEffects(order, actor) {
   const skuId = order.sku_id;
   const desired = skuId && !isCancelled(order.status) ? num(order.qty) : 0;
@@ -377,83 +514,120 @@ async function applyOrderEffects(order, actor) {
       const sku = snap.data();
       const stock = Math.max(0, num(sku.stock) - diff);
       await updateDoc(ref("skus", skuId), { stock });
-      await logStock({ ...sku, stock }, -diff, `Pesanan Shopee ${order.order_no} (${order.status})`, actor);
+      await logStock({ ...sku, stock }, -diff, `Pesanan ${chanOf(order)} ${order.order_no} (${order.status})`, actor);
       stockChanged = true;
     }
     await updateDoc(ref("shopee_orders", order.id), { deducted_qty: desired });
     order.deducted_qty = desired;
   }
-  const cashAdded = await syncOrderCash(order);
-  return [stockChanged, cashAdded];
+  return stockChanged;
 }
 
 const same = (a, b) => (a ?? null) === (b ?? null);
 async function processShopee(items, skus, orders, actor) {
   const skuNames = Object.fromEntries(skus.map((s) => [s.id, s.name]));
   const byKey = new Map(orders.filter((o) => o.order_no).map((o) => [orderKey(o), o]));
-  let created = 0, updated = 0, ignored = 0, stockC = 0, cashC = 0;
+  let created = 0, updated = 0, ignored = 0, stockC = 0;
   for (const item of items) {
+    const ch = item.channel || "Shopee";
     const raw = item.product_name;
     const display = item.sku_id && skuNames[item.sku_id] ? skuNames[item.sku_id] : raw;
-    const key = `${item.order_no}|${raw}|${item.variation || ""}`;
+    const key = orderKey({ channel: ch, order_no: item.order_no, item_id: item.item_id, shopee_title: raw, variation: item.variation });
     const existing = item.order_no ? byKey.get(key) : null;
     if (existing) {
+      const locked = !!existing.kas_final;   // angka akhir sudah dicatat: jangan ditimpa estimasi
+      const nilai = locked ? existing.nilai : item.nilai;
+      const biaya = locked ? existing.biaya : item.biaya;
       const incoming = {
-        status: item.status || existing.status, nilai: item.nilai, biaya: item.biaya, qty: item.qty,
+        status: item.status || existing.status, nilai, biaya, qty: item.qty,
         sku_id: item.sku_id, shopee_title: raw, variation: item.variation, tanggal_kirim: item.tanggal_kirim
       };
       const cmp = { ...existing, shopee_title: existing.shopee_title ?? existing.product_name };
       if (Object.keys(incoming).every((f) => same(cmp[f], incoming[f]))) { ignored++; continue; }
-      const newStatus = item.status || existing.status;
-      const cair = isCair(newStatus) ? true : isCancelled(newStatus) ? false : !!existing.cair;
-      const upd = {
-        ...incoming, status: newStatus, product_name: display,
-        pendapatan_akhir: item.nilai - item.biaya, cair,
-        tanggal_cair: cair ? (existing.tanggal_cair || todayStr()) : ""
-      };
+      const upd = { ...incoming, product_name: display, pendapatan_akhir: nilai - biaya };
+      if (item.tgl_update) upd.tgl_update = item.tgl_update;
       await updateDoc(ref("shopee_orders", existing.id), upd);
       const fresh = { ...existing, ...upd };
-      const [sc, cc] = await applyOrderEffects(fresh, actor);
+      const sc = await applyOrderEffects(fresh, actor);
       byKey.set(key, fresh);
-      updated++; if (sc) stockC++; if (cc) cashC++;
+      updated++; if (sc) stockC++;
     } else {
-      const cair = isCair(item.status);
       const id = newId("so");
       const doc_ = {
-        id, order_no: item.order_no, product_name: display, shopee_title: raw, variation: item.variation || "",
-        qty: item.qty, nilai: item.nilai, biaya: item.biaya,
+        id, channel: ch, order_no: item.order_no, item_id: item.item_id || "", product_name: display, shopee_title: raw,
+        variation: item.variation || "", qty: item.qty, nilai: item.nilai, biaya: item.biaya,
         pendapatan_akhir: item.pendapatan_akhir || (item.nilai - item.biaya),
         status: item.status || "Selesai", tanggal_kirim: item.tanggal_kirim || "",
-        tanggal_cair: cair ? todayStr() : "", cair, sku_id: item.sku_id || null,
+        tanggal_cair: "", cair: false, kas_final: false, sku_id: item.sku_id || null,
         deducted_qty: 0, created_at: nowIso()
       };
+      if (item.tgl_update) doc_.tgl_update = item.tgl_update;
       await setDoc(ref("shopee_orders", id), doc_);
-      const [sc, cc] = await applyOrderEffects(doc_, actor);
+      const sc = await applyOrderEffects(doc_, actor);
       byKey.set(key, doc_);
-      created++; if (sc) stockC++; if (cc) cashC++;
+      created++; if (sc) stockC++;
     }
   }
-  return { orders_new: created, orders_updated: updated, orders_ignored: ignored, stock_updated: stockC, cash_added: cashC };
+  return { orders_new: created, orders_updated: updated, orders_ignored: ignored, stock_updated: stockC };
 }
 
+// Ubah status / nilai pesanan. Uang (biaya, penghasilan akhir) hanya lewat recordFinal.
 async function updateShopeeOrder(o, payload, actor) {
   const u = {};
-  for (const k of ["status", "biaya", "nilai", "tanggal_cair", "cair"]) if (payload[k] !== undefined && payload[k] !== null) u[k] = payload[k];
-  if ("cair" in u) {
-    u.tanggal_cair = u.cair ? (u.tanggal_cair || o.tanggal_cair || todayStr()) : "";
-  } else if ("status" in u) {
-    if (isCair(u.status)) { u.cair = true; u.tanggal_cair = o.tanggal_cair || todayStr(); }
-    else if (isCancelled(u.status)) { u.cair = false; u.tanggal_cair = ""; }
+  if (payload.status !== undefined && payload.status !== null) u.status = payload.status;
+  if (!o.kas_final && payload.nilai !== undefined && payload.nilai !== null) {
+    u.nilai = num(payload.nilai);
+    u.pendapatan_akhir = u.nilai - num(o.biaya);
   }
-  const nilai = "nilai" in u ? u.nilai : num(o.nilai);
-  const biaya = "biaya" in u ? u.biaya : num(o.biaya);
-  u.pendapatan_akhir = nilai - biaya;
+  if (!Object.keys(u).length) return;
   await updateDoc(ref("shopee_orders", o.id), u);
   await applyOrderEffects({ ...o, ...u }, actor);
 }
-async function deleteShopeeOrder(id) {
-  await deleteDoc(ref("cash", "shopee_" + id));
-  await deleteDoc(ref("shopee_orders", id));
+
+// Catat penghasilan akhir SATU pesanan (semua barangnya). Dibagi ke tiap barang menurut nilai;
+// kas dicatat satu entri per pesanan, persis sebesar total yang Anda masukkan.
+async function recordFinal(rows, total, date, actor) {
+  const live = rows.filter((r) => !isCancelled(r.status));
+  if (!live.length) throw new Error("Semua barang pada pesanan ini berstatus batal");
+  const t = Math.round(num(total));
+  if (!(t > 0)) throw new Error("Penghasilan akhir harus lebih dari 0");
+  if (!date) throw new Error("Tanggal cair wajib diisi");
+  const shares = splitAmount(t, live.map((r) => num(r.nilai)));
+  for (let i = 0; i < live.length; i++) {
+    const r = live[i];
+    await updateDoc(ref("shopee_orders", r.id), {
+      cair: true, kas_final: true, tanggal_cair: date, pendapatan_akhir: shares[i], biaya: num(r.nilai) - shares[i]
+    });
+    await deleteDoc(ref("cash", "shopee_" + r.id));   // kas lama versi estimasi (bila ada) diganti
+  }
+  const first = live[0];
+  const ch = chanOf(first);
+  const cashId = cashIdOfGroup(first);
+  const data = {
+    id: cashId, date, pemasukan: t, ket_pemasukan: `${ch} - ${first.order_no}`, pengeluaran: 0, ket_pengeluaran: "",
+    source: `${ch} Auto`, channel: ch, ref: first.id
+  };
+  const snap = await getDoc(ref("cash", cashId));
+  if (snap.exists()) await updateDoc(ref("cash", cashId), data);
+  else await setDoc(ref("cash", cashId), { ...data, created_at: nowIso() });
+}
+// Batalkan pencatatan: kas pesanan dihapus, pesanan kembali "belum cair"
+async function clearFinal(rows) {
+  for (const r of rows) {
+    await updateDoc(ref("shopee_orders", r.id), { cair: false, kas_final: false, tanggal_cair: "" });
+    await deleteDoc(ref("cash", "shopee_" + r.id));
+  }
+  if (rows.length) await deleteDoc(ref("cash", cashIdOfGroup(rows[0])));
+}
+async function deleteShopeeOrder(o, all) {
+  await deleteDoc(ref("cash", "shopee_" + o.id));
+  await deleteDoc(ref("shopee_orders", o.id));
+  const gk = groupKeyOf(o);
+  const fin = all.filter((x) => x.id !== o.id && groupKeyOf(x) === gk && x.kas_final && !isCancelled(x.status));
+  const cashId = cashIdOfGroup(o);
+  if (!fin.length) { await deleteDoc(ref("cash", cashId)); return; }
+  const snap = await getDoc(ref("cash", cashId));
+  if (snap.exists()) await updateDoc(ref("cash", cashId), { pemasukan: sum(fin, (x) => x.pendapatan_akhir) });
 }
 
 /* ======================= FILE: BACA, EKSPOR, BACKUP ======================= */
@@ -612,7 +786,7 @@ const ChartBox = ({ type, data, options, depKey, height = 240 }) => {
 const NAV = [
   { to: "dashboard", label: "Dashboard", short: "Dashboard", icon: "grid", title: "Dashboard Overview" },
   { to: "inventory", label: "Master SKU & Stok", short: "SKU", icon: "box", title: "Master SKU & Stok Gudang" },
-  { to: "shopee", label: "Import Shopee", short: "Shopee", icon: "bag", title: "Monitoring Shopee BAC" },
+  { to: "shopee", label: "Penjualan Marketplace", short: "Penjualan", icon: "bag", title: "Monitoring Penjualan" },
   { to: "cashbook", label: "Buku Kas (BAC Cash)", short: "Kas", icon: "wallet", title: "Buku Kas (BAC Cash)" },
   { to: "settings", label: "Backup & Akun", short: "Akun", icon: "settings", title: "Backup & Akun" }
 ];
@@ -745,8 +919,8 @@ const Dashboard = ({ d }) => {
     <div class="space-y-5">
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <${KpiCard} icon="wallet" label="Total Saldo BAC Cash" value=${fmtRp(stats.saldo)} accent="bg-sky-500/10 text-sky-400" sub=${`${fmtRp(stats.total_pemasukan)} masuk (periode)`} />
-        <${KpiCard} icon="bag" label="Pendapatan Shopee" value=${fmtRp(stats.shopee_revenue)} accent="bg-orange-500/10 text-orange-500" sub="Total pendapatan akhir" />
-        <${KpiCard} icon="clock" label="Belum Cair (Masih Dikirim)" value=${fmtRp(stats.shopee_belum_cair)} accent="bg-amber-500/10 text-amber-400" sub="Dana Shopee belum masuk rekening" />
+        <${KpiCard} icon="bag" label="Penghasilan Diterima" value=${fmtRp(stats.shopee_revenue)} accent="bg-orange-500/10 text-orange-500" sub="Angka akhir yang sudah dicatat" />
+        <${KpiCard} icon="clock" label="Belum Cair (nilai kotor)" value=${fmtRp(stats.shopee_belum_cair)} accent="bg-amber-500/10 text-amber-400" sub="Sebelum potongan marketplace" />
         <${KpiCard} icon="alert" label="Stok Kritis" value=${stats.critical_count} accent="bg-rose-500/10 text-rose-400" sub=${`${stats.total_skus} SKU · nilai ${fmtRp(stats.stock_value)}`} />
       </div>
 
@@ -810,6 +984,28 @@ const Dashboard = ({ d }) => {
       </div>
 
       <div class="bg-[#161B26] border border-[#262F40] rounded-lg p-5">
+        <div class="flex items-center gap-2 mb-4 text-sky-400"><${Icon} name="tag" /><h3 class="text-sm font-semibold text-white">Kas per Channel (periode terpilih)</h3></div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead class="text-xs text-muted-foreground"><tr class="border-b border-[#262F40]">
+              <th class="text-left px-3 py-2 font-medium">Channel</th>
+              <th class="text-right px-3 py-2 font-medium">Pemasukan</th>
+              <th class="text-right px-3 py-2 font-medium">Pengeluaran</th>
+            </tr></thead>
+            <tbody>
+              ${stats.by_channel.length === 0 && html`<tr><td colspan="3" class="text-center text-muted-foreground py-6">Belum ada transaksi kas.</td></tr>`}
+              ${stats.by_channel.map((c) => html`<tr key=${c.channel} class="border-b border-[#262F40]/50">
+                <td class="px-3 py-2 font-medium whitespace-nowrap">${c.channel}</td>
+                <td class="px-3 py-2 text-right font-mono text-emerald-400 whitespace-nowrap">${fmtRp(c.pemasukan)}</td>
+                <td class="px-3 py-2 text-right font-mono text-rose-400 whitespace-nowrap">${fmtRp(c.pengeluaran)}</td>
+              </tr>`)}
+            </tbody>
+          </table>
+        </div>
+        <p class="text-[11px] text-muted-foreground mt-3">Tanpa tag = transaksi lama atau manual yang belum diberi channel.</p>
+      </div>
+
+      <div class="bg-[#161B26] border border-[#262F40] rounded-lg p-5">
         <div class="flex items-center gap-2 mb-4 text-sky-400"><${Icon} name="calendar" /><h3 class="text-sm font-semibold text-white">Rekap Bulanan (Tutup Buku)</h3></div>
         <div class="overflow-x-auto">
           <table class="w-full text-sm">
@@ -817,7 +1013,7 @@ const Dashboard = ({ d }) => {
               <th class="text-left px-3 py-2 font-medium">Bulan</th>
               <th class="text-right px-3 py-2 font-medium">Pemasukan</th>
               <th class="text-right px-3 py-2 font-medium">Pengeluaran</th>
-              <th class="text-right px-3 py-2 font-medium">Pendapatan Shopee</th>
+              <th class="text-right px-3 py-2 font-medium">Dari Marketplace</th>
               <th class="text-right px-3 py-2 font-medium">Laba Bersih</th>
             </tr></thead>
             <tbody>
@@ -826,7 +1022,7 @@ const Dashboard = ({ d }) => {
                 <td class="px-3 py-2 font-medium whitespace-nowrap">${labelMonth(r.month)}</td>
                 <td class="px-3 py-2 text-right font-mono text-emerald-400 whitespace-nowrap">${fmtRp(r.pemasukan)}</td>
                 <td class="px-3 py-2 text-right font-mono text-rose-400 whitespace-nowrap">${fmtRp(r.pengeluaran)}</td>
-                <td class="px-3 py-2 text-right font-mono text-orange-400 whitespace-nowrap">${fmtRp(r.shopee)}</td>
+                <td class="px-3 py-2 text-right font-mono text-orange-400 whitespace-nowrap">${fmtRp(r.marketplace)}</td>
                 <td class=${cx("px-3 py-2 text-right font-mono font-bold whitespace-nowrap", r.net < 0 ? "text-rose-400" : "text-sky-300")}>${fmtRp(r.net)}</td>
               </tr>`)}
             </tbody>
@@ -975,7 +1171,7 @@ const Inventory = ({ d }) => {
 };
 
 /* ======================= BUKU KAS ======================= */
-const emptyCash = () => ({ date: todayStr(), jenis: "pemasukan", amount: "", keterangan: "" });
+const emptyCash = () => ({ date: todayStr(), jenis: "pemasukan", amount: "", keterangan: "", channel: "Lainnya" });
 const SRC_LABEL = { "Shopee Auto": "🤖 Shopee Auto", "AI Voice": "🎙 AI Voice", Manual: "✋ Manual" };
 
 const CashBook = ({ d }) => {
@@ -983,6 +1179,7 @@ const CashBook = ({ d }) => {
   const [form, setForm] = useState(emptyCash());
   const [q, setQ] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
+  const [chFilter, setChFilter] = useState("all");
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [limit, setLimit] = useState(100);
@@ -996,8 +1193,11 @@ const CashBook = ({ d }) => {
   const filtered = useMemo(() => [...entries].reverse().filter((e) => {
     if (typeFilter === "pemasukan" && !(num(e.pemasukan) > 0)) return false;
     if (typeFilter === "pengeluaran" && !(num(e.pengeluaran) > 0)) return false;
+    const ch = channelOfCash(e);
+    if (chFilter === "none" && ch) return false;
+    if (chFilter !== "all" && chFilter !== "none" && ch !== chFilter) return false;
     return !q || `${e.ket_pemasukan} ${e.ket_pengeluaran} ${e.source}`.toLowerCase().includes(q.toLowerCase());
-  }), [entries, typeFilter, q]);
+  }), [entries, typeFilter, chFilter, q]);
 
   const setPeriod = (kind) => {
     const now = new Date();
@@ -1021,7 +1221,7 @@ const CashBook = ({ d }) => {
         date: form.date,
         pemasukan: income ? amount : 0, ket_pemasukan: income ? form.keterangan : "",
         pengeluaran: income ? 0 : amount, ket_pengeluaran: income ? "" : form.keterangan,
-        source: "Manual"
+        source: "Manual", channel: form.channel
       });
       toast("Transaksi tersimpan");
       setOpen(false); setForm(emptyCash());
@@ -1033,8 +1233,8 @@ const CashBook = ({ d }) => {
     try { await deleteCash(e.id); } catch (err) { toast("Gagal menghapus", "err"); }
   };
   const exportAs = (fmt) => {
-    const headers = ["Tanggal", "Pemasukan", "Keterangan Pemasukan", "Pengeluaran", "Keterangan Pengeluaran", "Saldo Akhir", "Sumber"];
-    const rows = entries.map((e) => [e.date || "", num(e.pemasukan), e.ket_pemasukan || "", num(e.pengeluaran), e.ket_pengeluaran || "", e.saldo_akhir, e.source || ""]);
+    const headers = ["Tanggal", "Pemasukan", "Keterangan Pemasukan", "Pengeluaran", "Keterangan Pengeluaran", "Saldo Akhir", "Sumber", "Channel"];
+    const rows = entries.map((e) => [e.date || "", num(e.pemasukan), e.ket_pemasukan || "", num(e.pengeluaran), e.ket_pengeluaran || "", e.saldo_akhir, e.source || "", channelOfCash(e)]);
     const name = `BAC_Cash_${todayStr()}`;
     try {
       if (fmt === "csv") downloadCsv(headers, rows, name + ".csv");
@@ -1086,6 +1286,11 @@ const CashBook = ({ d }) => {
         <option value="pemasukan">Pemasukan</option>
         <option value="pengeluaran">Pengeluaran</option>
       <//>
+      <${Sel} value=${chFilter} onChange=${(e) => setChFilter(e.target.value)}>
+        <option value="all">Semua Channel</option>
+        ${CHANNELS.map((c) => html`<option key=${c} value=${c}>${c}</option>`)}
+        <option value="none">Tanpa tag</option>
+      <//>
       <div class="flex gap-2">
         <${Menu} label="Ekspor" icon="download" items=${[{ label: "Excel (.xlsx)", onClick: () => exportAs("xlsx") }, { label: "CSV", onClick: () => exportAs("csv") }]} />
         <${Btn} onClick=${() => { setForm(emptyCash()); setOpen(true); }} cls="flex-1 lg:flex-none"><${Icon} name="plus" /> Tambah<//>
@@ -1098,7 +1303,8 @@ const CashBook = ({ d }) => {
         <div class="flex items-center justify-between px-4 py-2 bg-[#0F1420] border-b border-[#262F40]">
           <span class="font-mono text-xs text-muted-foreground">${fmtDate(e.date)}</span>
           <div class="flex items-center gap-2">
-            <span class="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground">${SRC_LABEL[e.source] || e.source}</span>
+            ${channelOfCash(e) && html`<span class="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/20">${channelOfCash(e)}</span>`}
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-muted-foreground">${SRC_LABEL[e.source] || (/ Auto$/.test(e.source || "") ? "🤖 " + e.source : e.source)}</span>
             <button onClick=${() => remove(e)} class="text-muted-foreground hover:text-rose-400" aria-label="Hapus transaksi"><${Icon} name="trash" cls="w-3.5 h-3.5" /></button>
           </div>
         </div>
@@ -1131,6 +1337,11 @@ const CashBook = ({ d }) => {
         </div>
         <div><${Lbl}>Nominal (Rp)<//><${Inp} type="number" inputmode="numeric" value=${form.amount} onInput=${(e) => setForm({ ...form, amount: e.target.value })} cls="font-mono" placeholder="0" /></div>
         <div><${Lbl}>Keterangan<//><${Inp} value=${form.keterangan} onInput=${(e) => setForm({ ...form, keterangan: e.target.value })} /></div>
+        <div><${Lbl}>Channel<//>
+          <${Sel} value=${form.channel} onChange=${(e) => setForm({ ...form, channel: e.target.value })} cls="w-full !bg-[#0B0F17]">
+            ${CHANNELS.map((c) => html`<option key=${c} value=${c}>${c}</option>`)}
+          <//>
+        </div>
         <${Btn} onClick=${save} disabled=${saving} cls="w-full">${saving ? html`<${Spinner} />` : null} Simpan<//>
       </div>
     <//>
@@ -1180,7 +1391,7 @@ const ImportTab = ({ d }) => {
     setProcessing(true);
     try {
       const r = await processShopee(preview.items, d.skus, d.orders, d.actor);
-      toast(`${r.orders_new} baru, ${r.orders_updated} diperbarui, ${r.orders_ignored} diabaikan · ${r.stock_updated} stok, ${r.cash_added} kas`);
+      toast(`${r.orders_new} baru, ${r.orders_updated} diperbarui, ${r.orders_ignored} diabaikan, ${r.stock_updated} stok disesuaikan. Kas belum dicatat: isi Penghasilan Akhir di tab Monitoring.`);
       setRows(null); setFile(null);
     } catch (e) { console.error(e); toast("Gagal memproses: " + (e.message || e), "err"); }
     finally { setProcessing(false); }
@@ -1197,7 +1408,7 @@ const ImportTab = ({ d }) => {
 
   return html`<div>
     <div class="flex flex-col sm:flex-row items-stretch sm:items-end justify-between gap-3 mb-4">
-      <p class="text-sm text-muted-foreground max-w-md">Upload laporan Shopee. Sistem mengecek <b>No. Pesanan</b>: data baru ditambah, status yang berubah diperbarui (stok dan kas ikut menyesuaikan), duplikat diabaikan.</p>
+      <p class="text-sm text-muted-foreground max-w-md">Upload laporan Shopee. Sistem mengecek <b>No. Pesanan</b>: data baru ditambah, status yang berubah diperbarui (stok ikut menyesuaikan), duplikat diabaikan. <b>Kas tidak dicatat dari impor</b>: angka akhir diisi di tab Monitoring.</p>
       <div class="flex items-end gap-2">
         <div><${Lbl}>Est. Biaya Shopee (%)<//><${Inp} type="number" inputmode="decimal" value=${biayaPct} onInput=${(e) => setBiayaPct(Number(e.target.value))} cls="!w-24 !h-9 font-mono" /></div>
         <${Btn} variant="outline" onClick=${saveDefault} cls="!h-9 !px-3" aria-label="Simpan sebagai default"><${Icon} name="save" /><//>
@@ -1248,67 +1459,146 @@ const ImportTab = ({ d }) => {
   </div>`;
 };
 
+const FinalDialog = ({ rows, onClose, actor }) => {
+  const first = rows[0];
+  const live = rows.filter((r) => !isCancelled(r.status));
+  const nilai = sum(live, (r) => r.nilai);
+  const done = live.length > 0 && live.every((r) => r.kas_final);
+  const legacy = live.some((r) => r.cair && !r.kas_final);
+  const [mode, setMode] = useState("final");
+  const [fin, setFin] = useState(done ? String(Math.round(sum(live, (r) => r.pendapatan_akhir))) : "");
+  const [c1, setC1] = useState("");
+  const [c2, setC2] = useState("");
+  const [c3, setC3] = useState("");
+  const [date, setDate] = useState(done || legacy ? (first.tanggal_cair || todayStr()) : todayStr());
+  const [busy, setBusy] = useState(false);
+  const total = mode === "final" ? Number(fin) || 0 : nilai - (Number(c1) || 0) - (Number(c2) || 0) - (Number(c3) || 0);
+  const potongan = nilai - total;
+  const pct = nilai > 0 ? (potongan / nilai) * 100 : 0;
+  const warn = !(total > 0) ? "" : total > nilai ? "Lebih besar dari nilai pesanan." : pct > 40 ? "Potongan lebih dari 40% dari nilai pesanan." : "";
+
+  const save = async () => {
+    if (!(total > 0)) { toast("Isi penghasilan akhir lebih dari 0", "err"); return; }
+    if (warn && !confirm(`${warn}\n\nTetap catat ${fmtRp(total)} ke kas?`)) return;
+    setBusy(true);
+    try { await recordFinal(rows, total, date, actor); toast(`Tercatat di kas: ${fmtRp(total)}`); onClose(); }
+    catch (e) { toast(e.message || "Gagal menyimpan", "err"); }
+    finally { setBusy(false); }
+  };
+  const undo = async () => {
+    if (!confirm("Batalkan pencatatan? Entri kas pesanan ini akan dihapus.")) return;
+    setBusy(true);
+    try { await clearFinal(rows); toast("Pencatatan dibatalkan, kas dihapus"); onClose(); }
+    catch (e) { toast("Gagal membatalkan", "err"); }
+    finally { setBusy(false); }
+  };
+
+  return html`<${Modal} open=${true} onClose=${onClose} title=${`Penghasilan Akhir ${first.order_no}`} wide=${true}>
+    <div class="space-y-3">
+      ${legacy && html`<p class="text-xs rounded-md border border-rose-500/40 bg-rose-500/10 text-rose-200 p-2.5">Angka lama pesanan ini berupa estimasi. Masukkan Penghasilan Akhir yang benar dari rincian pesanan; kas lama akan diganti.</p>`}
+      <div class="rounded-md bg-[#0B0F17] border border-[#262F40] p-3">
+        <p class="text-[11px] text-muted-foreground mb-1">${chanOf(first)} · ${rows.length} barang</p>
+        ${rows.map((r) => html`<p key=${r.id} class="text-xs text-slate-300 truncate">${r.qty}x ${r.product_name} <span class=${cx("font-mono", isCancelled(r.status) && "line-through text-rose-400")}>${fmtNum(r.nilai)}</span></p>`)}
+        <p class="text-sm mt-2">Nilai pesanan: <span class="font-mono font-bold">${fmtRp(nilai)}</span></p>
+      </div>
+
+      <div class="inline-flex rounded-md border border-[#262F40] overflow-hidden text-xs">
+        <button onClick=${() => setMode("final")} class=${cx("px-3 py-1.5", mode === "final" ? "bg-sky-500/20 text-sky-300" : "text-muted-foreground")}>Isi angka akhir</button>
+        <button onClick=${() => setMode("parts")} class=${cx("px-3 py-1.5", mode === "parts" ? "bg-sky-500/20 text-sky-300" : "text-muted-foreground")}>Hitung dari potongan</button>
+      </div>
+
+      ${mode === "final"
+        ? html`<div><${Lbl}>Penghasilan Akhir (sesuai rincian pesanan di marketplace)<//>
+            <${Inp} type="number" inputmode="numeric" value=${fin} onInput=${(e) => setFin(e.target.value)} placeholder="mis. 308950" cls="font-mono !h-12 text-lg" autofocus />
+          </div>`
+        : html`<div class="space-y-2">
+            <div><${Lbl}>Biaya platform / komisi<//><${Inp} type="number" inputmode="numeric" value=${c1} onInput=${(e) => setC1(e.target.value)} cls="font-mono" /></div>
+            <div><${Lbl}>Biaya ongkir / program (mis. Gratis Ongkir XTRA)<//><${Inp} type="number" inputmode="numeric" value=${c2} onInput=${(e) => setC2(e.target.value)} cls="font-mono" /></div>
+            <div><${Lbl}>Potongan lain<//><${Inp} type="number" inputmode="numeric" value=${c3} onInput=${(e) => setC3(e.target.value)} cls="font-mono" /></div>
+          </div>`}
+
+      <div class="rounded-md border border-[#262F40] p-3 text-sm space-y-1">
+        <div class="flex justify-between"><span class="text-muted-foreground">Potongan marketplace</span><span class="font-mono text-rose-400">${total > 0 ? fmtRp(potongan) : "-"}${total > 0 ? ` (${pct.toFixed(1)}%)` : ""}</span></div>
+        <div class="flex justify-between"><span class="text-muted-foreground">Dicatat ke kas</span><span class="font-mono font-bold text-emerald-400">${total > 0 ? fmtRp(total) : "-"}</span></div>
+      </div>
+      ${warn && html`<p class="text-xs text-amber-300">${warn} Periksa lagi angkanya sebelum menyimpan.</p>`}
+
+      <div><${Lbl}>Tanggal cair (tanggal tercatat di kas)<//><${Inp} type="date" value=${date} onInput=${(e) => setDate(e.target.value)} /></div>
+      <${Btn} onClick=${save} disabled=${busy} cls="w-full !h-12">${busy ? html`<${Spinner} />` : null} Simpan dan catat ke kas<//>
+      ${live.some((r) => r.kas_final) && html`<${Btn} variant="outline" onClick=${undo} disabled=${busy} cls="w-full !text-rose-400">Batalkan pencatatan kas<//>`}
+    </div>
+  <//>`;
+};
+
 const MonitoringTab = ({ d }) => {
   const [edit, setEdit] = useState(null);
+  const [finKey, setFinKey] = useState(null);
   const [statusFilter, setStatusFilter] = useState("all");
   const [q, setQ] = useState("");
 
   const skuCode = useMemo(() => Object.fromEntries(d.skus.map((s) => [s.id, s.code])), [d.skus]);
   const orders = useMemo(() => d.orders.map((o) => ({ ...o, sku_code: o.sku_id ? skuCode[o.sku_id] || null : null })), [d.orders, skuCode]);
+  const live = orders.filter((o) => !isCancelled(o.status));
+  const belum = live.filter((o) => !o.cair);
   const totals = {
-    nilai: sum(orders, (o) => o.nilai), biaya: sum(orders, (o) => o.biaya), pendapatan_akhir: sum(orders, (o) => o.pendapatan_akhir),
-    count: orders.length, belum_cair: orders.filter((o) => !o.cair).length
+    nilai: sum(live, (o) => o.nilai),
+    biaya: sum(orders.filter((o) => o.kas_final), (o) => o.biaya),
+    diterima: sum(orders.filter((o) => o.cair), (o) => o.pendapatan_akhir),
+    belumNilai: sum(belum, (o) => o.nilai),
+    belumCount: belum.length,
+    fix: orders.filter(needsFix).length
   };
   const filtered = orders.filter((o) => {
     if (statusFilter !== "all") {
       const s = String(o.status || "").toLowerCase();
       if (statusFilter === "cair" && !o.cair) return false;
       if (statusFilter === "belum" && o.cair) return false;
+      if (statusFilter === "fix" && !needsFix(o)) return false;
       if (["selesai", "proses", "dibatalkan"].includes(statusFilter) && !s.includes(statusFilter)) return false;
     }
     if (q && !`${o.order_no} ${o.sku_code || ""} ${o.product_name} ${o.shopee_title || ""}`.toLowerCase().includes(q.toLowerCase())) return false;
     return true;
   });
+  const finRows = finKey ? d.orders.filter((x) => groupKeyOf(x) === finKey) : [];
 
-  const reconcile = async (o) => {
-    try {
-      await updateShopeeOrder(o, { cair: !o.cair, status: !o.cair ? "Cair" : "Selesai" }, d.actor);
-      toast(!o.cair ? "Ditandai Cair (masuk rekening)" : "Status cair dibatalkan");
-    } catch (e) { toast("Gagal memperbarui", "err"); }
-  };
   const remove = async (o) => {
-    if (!confirm(`Hapus pesanan ${o.order_no}? Catatan kas otomatisnya ikut terhapus.`)) return;
-    try { await deleteShopeeOrder(o.id); } catch (e) { toast("Gagal menghapus", "err"); }
+    if (!confirm(`Hapus pesanan ${o.order_no}? Catatan kas pesanan ini ikut disesuaikan.`)) return;
+    try { await deleteShopeeOrder(o, d.orders); } catch (e) { toast("Gagal menghapus", "err"); }
   };
   const saveEdit = async () => {
     const base = d.orders.find((x) => x.id === edit.id) || edit;
     try {
-      await updateShopeeOrder(base, { status: edit.status, biaya: Number(edit.biaya) || 0, nilai: Number(edit.nilai) || 0, tanggal_cair: edit.tanggal_cair || "" }, d.actor);
+      await updateShopeeOrder(base, { status: edit.status, nilai: Number(edit.nilai) || 0 }, d.actor);
       setEdit(null); toast("Pesanan diperbarui");
     } catch (e) { toast("Gagal menyimpan", "err"); }
   };
   const exportAs = (fmt) => {
-    const headers = ["No. Pesanan", "Produk", "SKU", "Tgl Kirim", "Tgl Cair", "Nilai", "Status", "Biaya", "Pendapatan Akhir"];
-    const rows = orders.map((o) => [o.order_no || "", o.product_name || "", o.sku_code || "", o.tanggal_kirim || "", o.tanggal_cair || "", num(o.nilai), o.status || "", num(o.biaya), num(o.pendapatan_akhir)]);
-    rows.push(["TOTAL", "", "", "", "", totals.nilai, "", totals.biaya, totals.pendapatan_akhir]);
-    const name = `Monitoring_Shopee_${todayStr()}`;
+    const headers = ["No. Pesanan", "Channel", "Produk", "SKU", "Tgl Kirim", "Tgl Cair", "Nilai", "Status", "Potongan (final)", "Penghasilan Akhir (final)", "Pencatatan"];
+    const rows = orders.map((o) => [o.order_no || "", chanOf(o), o.product_name || "", o.sku_code || "", o.tanggal_kirim || "", o.tanggal_cair || "", num(o.nilai), o.status || "",
+      o.kas_final ? num(o.biaya) : "", o.kas_final ? num(o.pendapatan_akhir) : "", needsFix(o) ? "Perlu koreksi" : o.kas_final ? "Final" : "Belum"]);
+    rows.push(["TOTAL", "", "", "", "", "", totals.nilai, "", totals.biaya, totals.diterima, ""]);
+    const name = `Monitoring_Penjualan_${todayStr()}`;
     try {
-      if (fmt === "csv") downloadCsv(headers, rows, name + ".csv"); else downloadXlsx(headers, rows, "Monitoring Shopee", name + ".xlsx");
+      if (fmt === "csv") downloadCsv(headers, rows, name + ".csv"); else downloadXlsx(headers, rows, "Monitoring Penjualan", name + ".xlsx");
       toast(`Ekspor ${fmt.toUpperCase()} berhasil`);
     } catch (e) { toast("Gagal ekspor", "err"); }
   };
 
   return html`<div>
+    ${totals.fix > 0 && html`<button onClick=${() => setStatusFilter("fix")} class="w-full text-left mb-3 rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-200">
+      ${totals.fix} pesanan perlu dikoreksi: angkanya masih estimasi dari versi lama. Ketuk untuk menampilkannya, lalu isi Penghasilan Akhir yang benar.
+    </button>`}
     <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-      <div class="bg-[#161B26] border border-[#262F40] rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Total Nilai</p><p class="font-mono text-lg font-bold break-words">${fmtRp(totals.nilai)}</p></div>
-      <div class="bg-[#161B26] border-l-4 border-rose-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Total Biaya</p><p class="font-mono text-lg font-bold text-rose-400 break-words">${fmtRp(totals.biaya)}</p></div>
-      <div class="bg-[#161B26] border-l-4 border-emerald-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Total Pendapatan Akhir</p><p class="font-mono text-lg font-bold text-emerald-400 break-words">${fmtRp(totals.pendapatan_akhir)}</p></div>
-      <div class="bg-[#161B26] border-l-4 border-amber-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Belum Cair</p><p class="font-mono text-lg font-bold text-amber-400">${totals.belum_cair} pesanan</p></div>
+      <div class="bg-[#161B26] border border-[#262F40] rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Nilai Pesanan (tanpa batal)</p><p class="font-mono text-lg font-bold break-words">${fmtRp(totals.nilai)}</p></div>
+      <div class="bg-[#161B26] border-l-4 border-rose-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Potongan Marketplace (final)</p><p class="font-mono text-lg font-bold text-rose-400 break-words">${fmtRp(totals.biaya)}</p></div>
+      <div class="bg-[#161B26] border-l-4 border-emerald-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Penghasilan Diterima</p><p class="font-mono text-lg font-bold text-emerald-400 break-words">${fmtRp(totals.diterima)}</p></div>
+      <div class="bg-[#161B26] border-l-4 border-amber-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Belum Cair</p><p class="font-mono text-lg font-bold text-amber-400">${totals.belumCount} pesanan</p><p class="text-[10px] text-muted-foreground">nilai kotor ${fmtRp(totals.belumNilai)}</p></div>
     </div>
 
     <div class="flex flex-col sm:flex-row sm:items-center gap-3 mb-3">
       <${Sel} value=${statusFilter} onChange=${(e) => setStatusFilter(e.target.value)} cls="!h-9 text-xs">
         <option value="all">Semua Status</option><option value="cair">Sudah Cair</option><option value="belum">Belum Cair</option>
+        <option value="fix">Perlu Dikoreksi</option>
         <option value="selesai">Selesai</option><option value="proses">Proses</option><option value="dibatalkan">Dibatalkan</option>
       <//>
       <div class="relative flex-1">
@@ -1323,14 +1613,15 @@ const MonitoringTab = ({ d }) => {
         <table class="w-full text-sm">
           <thead class="bg-[#0F1420] text-xs text-muted-foreground"><tr>
             <th class="text-left px-3 py-2.5">No. Pesanan / Barang</th><th class="text-left px-3 py-2.5">Tgl Kirim</th><th class="text-left px-3 py-2.5">Tgl Cair</th>
-            <th class="text-right px-3 py-2.5">Nilai</th><th class="text-center px-3 py-2.5">Status</th><th class="text-right px-3 py-2.5">Biaya</th>
-            <th class="text-right px-3 py-2.5">Pendapatan Akhir</th><th class="text-center px-3 py-2.5">Aksi</th>
+            <th class="text-right px-3 py-2.5">Nilai</th><th class="text-center px-3 py-2.5">Status</th><th class="text-right px-3 py-2.5">Potongan</th>
+            <th class="text-right px-3 py-2.5">Penghasilan Akhir</th><th class="text-center px-3 py-2.5">Aksi</th>
           </tr></thead>
           <tbody>
-            ${filtered.length === 0 && html`<tr><td colspan="8" class="text-center text-muted-foreground py-8">Belum ada pesanan. Buka tab Import Laporan untuk memasukkan laporan Shopee.</td></tr>`}
-            ${filtered.map((o) => html`<tr key=${o.id} class=${cx("border-t border-[#262F40] border-l-4", o.cair ? "border-l-emerald-500" : "border-l-amber-500")}>
+            ${filtered.length === 0 && html`<tr><td colspan="8" class="text-center text-muted-foreground py-8">Belum ada pesanan. Buka tab Import Laporan untuk memasukkan laporan marketplace.</td></tr>`}
+            ${filtered.map((o) => html`<tr key=${o.id} class=${cx("border-t border-[#262F40] border-l-4", needsFix(o) ? "border-l-rose-500" : o.kas_final ? "border-l-emerald-500" : "border-l-amber-500")}>
               <td class="px-3 py-2.5">
                 <span class="font-mono text-xs text-sky-400">${o.order_no}</span>
+                <span class="ml-1 text-[9px] px-1 py-0.5 rounded bg-white/5 text-muted-foreground">${chanOf(o)}</span>
                 ${o.sku_id
                   ? html`<span class="ml-1 font-mono text-[9px] px-1 py-0.5 rounded bg-slate-800 text-sky-300 border border-slate-700">${o.sku_code}</span><p class="text-xs text-slate-200 truncate max-w-[200px]">${o.product_name}</p>`
                   : html`<span class="ml-1 text-[9px] px-1 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/30">Belum dipetakan</span><p class="text-[10px] text-muted-foreground truncate max-w-[200px]">${o.shopee_title || o.product_name}</p>`}
@@ -1339,11 +1630,16 @@ const MonitoringTab = ({ d }) => {
               <td class="px-3 py-2.5 font-mono text-xs text-emerald-300 whitespace-nowrap">${o.tanggal_cair ? fmtDate(o.tanggal_cair) : "-"}</td>
               <td class="px-3 py-2.5 text-right font-mono whitespace-nowrap">${fmtNum(o.nilai)}</td>
               <td class="px-3 py-2.5 text-center"><span class=${cx("text-[10px] px-2 py-0.5 rounded border whitespace-nowrap", statusColor(o.status))}>${o.status}</span></td>
-              <td class="px-3 py-2.5 text-right font-mono text-rose-400 whitespace-nowrap">${fmtNum(o.biaya)}</td>
-              <td class="px-3 py-2.5 text-right font-mono text-emerald-400 font-bold whitespace-nowrap">${fmtNum(o.pendapatan_akhir)}</td>
+              <td class="px-3 py-2.5 text-right font-mono text-rose-400 whitespace-nowrap">${o.kas_final ? fmtNum(o.biaya) : "-"}</td>
+              <td class="px-3 py-2.5 text-right whitespace-nowrap">
+                ${isCancelled(o.status) && !o.kas_final ? html`<span class="text-muted-foreground">-</span>`
+                  : o.kas_final ? html`<button onClick=${() => setFinKey(groupKeyOf(o))} class="font-mono font-bold text-emerald-400 hover:underline">${fmtNum(o.pendapatan_akhir)}</button>`
+                  : o.cair ? html`<button onClick=${() => setFinKey(groupKeyOf(o))} class="text-[11px] px-2 py-1 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10">Koreksi</button>`
+                  : html`<button onClick=${() => setFinKey(groupKeyOf(o))} class="text-[11px] px-2 py-1 rounded border border-amber-500/50 text-amber-300 hover:bg-amber-500/10">Isi angka</button>`}
+              </td>
               <td class="px-3 py-2.5">
                 <div class="flex items-center justify-center gap-1">
-                  <button onClick=${() => reconcile(o)} title=${o.cair ? "Batalkan cair" : "Tandai cair"} aria-label=${o.cair ? "Batalkan cair" : "Tandai cair"} class=${cx("w-8 h-8 rounded flex items-center justify-center", o.cair ? "bg-emerald-500/20 text-emerald-400" : "bg-amber-500/10 text-amber-400 hover:bg-amber-500/20")}><${Icon} name=${o.cair ? "cash" : "clock"} cls="w-4 h-4" /></button>
+                  <button onClick=${() => setFinKey(groupKeyOf(o))} title="Penghasilan akhir" aria-label="Penghasilan akhir" class=${cx("w-8 h-8 rounded flex items-center justify-center", o.kas_final ? "bg-emerald-500/20 text-emerald-400" : "bg-amber-500/10 text-amber-400 hover:bg-amber-500/20")}><${Icon} name=${o.kas_final ? "cash" : "clock"} cls="w-4 h-4" /></button>
                   <button onClick=${() => setEdit({ ...o })} aria-label="Edit pesanan" class="w-8 h-8 rounded flex items-center justify-center text-muted-foreground hover:bg-white/10"><${Icon} name="edit" cls="w-3.5 h-3.5" /></button>
                   <button onClick=${() => remove(o)} aria-label="Hapus pesanan" class="w-8 h-8 rounded flex items-center justify-center text-muted-foreground hover:bg-rose-500/10 hover:text-rose-400"><${Icon} name="trash" cls="w-3.5 h-3.5" /></button>
                 </div>
@@ -1351,28 +1647,30 @@ const MonitoringTab = ({ d }) => {
             </tr>`)}
           </tbody>
           ${orders.length > 0 && html`<tfoot class="bg-[#0F1420] font-mono font-bold border-t-2 border-[#262F40]"><tr>
-            <td class="px-3 py-2.5 text-xs" colspan="3">TOTAL (${totals.count} pesanan)</td>
+            <td class="px-3 py-2.5 text-xs" colspan="3">TOTAL (${orders.length} baris)</td>
             <td class="px-3 py-2.5 text-right whitespace-nowrap">${fmtNum(totals.nilai)}</td><td></td>
             <td class="px-3 py-2.5 text-right text-rose-400 whitespace-nowrap">${fmtNum(totals.biaya)}</td>
-            <td class="px-3 py-2.5 text-right text-emerald-400 whitespace-nowrap">${fmtNum(totals.pendapatan_akhir)}</td><td></td>
+            <td class="px-3 py-2.5 text-right text-emerald-400 whitespace-nowrap">${fmtNum(totals.diterima)}</td><td></td>
           </tr></tfoot>`}
         </table>
       </div>
     </div>
+    <p class="text-[11px] text-muted-foreground mt-2">Penghasilan Akhir hanya terisi setelah Anda memasukkannya. Angka itulah yang masuk ke Buku Kas, tidak pernah hasil tebakan sistem.</p>
+
+    ${finRows.length > 0 && html`<${FinalDialog} key=${finKey} rows=${finRows} onClose=${() => setFinKey(null)} actor=${d.actor} />`}
 
     <${Modal} open=${!!edit} onClose=${() => setEdit(null)} title=${`Edit Pesanan ${edit ? edit.order_no : ""}`}>
       ${edit && html`<div class="space-y-3">
         <div><${Lbl}>Status<//>
           <${Sel} value=${edit.status} onChange=${(e) => setEdit({ ...edit, status: e.target.value })} cls="w-full !bg-[#0B0F17]">
-            ${["Selesai", "Sedang Dikirim", "Proses", "Cair", "Dibatalkan", "Dikembalikan"].map((s) => html`<option key=${s} value=${s}>${s}</option>`)}
+            ${[...new Set(["Selesai", "Sedang Dikirim", "Proses", "Dibatalkan", "Dikembalikan", edit.status])].filter(Boolean).map((s) => html`<option key=${s} value=${s}>${s}</option>`)}
           <//>
         </div>
-        <div class="grid grid-cols-2 gap-3">
-          <div><${Lbl}>Nilai<//><${Inp} type="number" inputmode="numeric" value=${edit.nilai} onInput=${(e) => setEdit({ ...edit, nilai: e.target.value })} cls="font-mono" /></div>
-          <div><${Lbl}>Biaya<//><${Inp} type="number" inputmode="numeric" value=${edit.biaya} onInput=${(e) => setEdit({ ...edit, biaya: e.target.value })} cls="font-mono" /></div>
+        <div><${Lbl}>Nilai pesanan<//>
+          <${Inp} type="number" inputmode="numeric" value=${edit.nilai} onInput=${(e) => setEdit({ ...edit, nilai: e.target.value })} disabled=${!!edit.kas_final} cls="font-mono" />
+          ${edit.kas_final && html`<p class="text-[11px] text-muted-foreground mt-1">Nilai dikunci karena penghasilan akhir sudah dicatat. Batalkan pencatatan dulu jika perlu mengubahnya.</p>`}
         </div>
-        <div><${Lbl}>Tanggal Cair<//><${Inp} type="date" value=${edit.tanggal_cair || ""} onInput=${(e) => setEdit({ ...edit, tanggal_cair: e.target.value })} /></div>
-        <p class="text-xs text-muted-foreground">Pendapatan akhir = ${fmtRp((Number(edit.nilai) || 0) - (Number(edit.biaya) || 0))}</p>
+        <p class="text-xs text-muted-foreground">Potongan dan Penghasilan Akhir diisi lewat tombol jam/uang pada baris pesanan.</p>
         <${Btn} onClick=${saveEdit} cls="w-full">Simpan<//>
       </div>`}
     <//>
@@ -1430,6 +1728,7 @@ const SettingsPage = ({ d, user }) => {
       <input ref=${pick} type="file" accept=".json,application/json" class="hidden" onChange=${(e) => { doRestore(e.target.files[0]); e.target.value = ""; }} />
       <${Btn} variant="outline" onClick=${() => pick.current && pick.current.click()} disabled=${busy !== ""}>${busy === "restore" ? html`<${Spinner} />` : html`<${Icon} name="upload" />`} Pilih file backup<//>
     </div>
+    <p class="text-[11px] text-muted-foreground font-mono">BAC Business Hub · Versi ${APP_VERSION}</p>
   </div>`;
 };
 
@@ -1538,7 +1837,7 @@ const Login = ({ denied }) => {
           <${Btn} onClick=${() => location.reload()} cls="w-full">Muat ulang halaman<//>
         </div>`}
       </div>
-      <p class="mt-4 text-[10px] text-muted-foreground text-center font-mono">Versi 5</p>
+      <p class="mt-4 text-[10px] text-muted-foreground text-center font-mono">Versi ${APP_VERSION}</p>
     </div>
   </div>`;
 };
