@@ -99,7 +99,7 @@ const firebaseConfig = {
 };
 // Harus sama dengan daftar email di aturan keamanan Firestore (firestore.rules)
 const ALLOWED_EMAILS = ["ibrahimazzukhruf55@gmail.com", "mountjavva@gmail.com"];
-const APP_VERSION = 6;
+const APP_VERSION = 7;
 const emailOf = (u) => String((u && (u.email || ((u.providerData || []).find((p) => p && p.email) || {}).email)) || "").toLowerCase();
 
 // Client ID OAuth (publik, bukan rahasia). Dipakai untuk tombol "Masuk dengan Google" langsung di halaman.
@@ -209,7 +209,8 @@ const computeDashboard = ({ skus, cash, orders, settings, start, end }) => {
     critical_count: critical.length,
     critical_items: critical.slice(0, 5),
     shopee_revenue: sum(ords.filter((o) => o.cair), (o) => o.pendapatan_akhir),
-    shopee_belum_cair: sum(ords.filter((o) => !o.cair && !isCancelled(o.status)), (o) => o.nilai),
+    shopee_belum_cair: estimateUnpaid(ords, getFeeCfg(settings)).net,
+    shopee_belum_gross: estimateUnpaid(ords, getFeeCfg(settings)).gross,
     cash_flow: Object.values(flow).sort((a, b) => a.date.localeCompare(b.date)).slice(-14)
   };
 };
@@ -264,6 +265,51 @@ const splitAmount = (total, weights) => {
   for (let k = 0; k < order.length && rest > 0; k++, rest--) base[order[k][1]]++;
   return base;
 };
+// ===== Model perkiraan potongan Shopee (hasil analisis rincian penghasilan; semua angka bisa diatur) =====
+// potongan = voucher toko + (nilai - voucher) x (admin% + XTRA% + PPh% + AMS%) + biaya proses per pesanan
+const DEFAULT_FEE = { admin: 10, xtra: 7.5, pph: 0.5, proses: 1250, ams: 0 };
+const getFeeCfg = (s) => {
+  const g = (k, d) => (s && s[k] !== undefined && s[k] !== null && s[k] !== "" && isFinite(Number(s[k])) ? Number(s[k]) : d);
+  return { admin: g("fee_admin", DEFAULT_FEE.admin), xtra: g("fee_xtra", DEFAULT_FEE.xtra), pph: g("fee_pph", DEFAULT_FEE.pph), proses: g("fee_proses", DEFAULT_FEE.proses), ams: g("fee_ams", DEFAULT_FEE.ams) };
+};
+const estimateOrder = (rows, cfg) => {
+  const live = rows.filter((r) => !isCancelled(r.status));
+  const nilai = sum(live, (r) => r.nilai);
+  const voucher = Math.min(nilai, sum(live, (r) => r.voucher));
+  const base = Math.max(0, nilai - voucher);
+  const pc = (p) => Math.round((base * num(p)) / 100);
+  const admin = pc(cfg.admin), xtra = pc(cfg.xtra), pph = pc(cfg.pph), ams = pc(cfg.ams);
+  const proses = nilai > 0 ? Math.round(num(cfg.proses)) : 0;
+  const potongan = voucher + admin + xtra + pph + ams + proses;
+  return { nilai, voucher, admin, xtra, pph, ams, proses, potongan, net: nilai - potongan };
+};
+// Perkiraan per baris untuk pesanan yang belum final (potongan per pesanan dibagi ke barang menurut nilai)
+const estimateRows = (orders, cfg) => {
+  const groups = new Map();
+  for (const o of orders) {
+    if (o.cair || o.kas_final) continue;
+    const k = groupKeyOf(o);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(o);
+  }
+  const out = new Map();
+  for (const rows of groups.values()) {
+    const live = rows.filter((r) => !isCancelled(r.status));
+    if (!live.length) continue;
+    const e = estimateOrder(rows, cfg);
+    const shares = splitAmount(e.potongan, live.map((r) => num(r.nilai)));
+    live.forEach((r, i) => out.set(r.id, { potongan: shares[i], net: num(r.nilai) - shares[i] }));
+  }
+  return out;
+};
+const estimateUnpaid = (orders, cfg) => {
+  const m = estimateRows(orders, cfg);
+  let net = 0, gross = 0, count = 0;
+  for (const o of orders) { const e = m.get(o.id); if (e) { net += e.net; gross += num(o.nilai); count++; } }
+  return { net, gross, count };
+};
+const PART_KEYS = ["voucher", "admin", "proses", "xtra", "pph", "ams", "lain"];
+const netFromParts = (nilai, p) => nilai - PART_KEYS.reduce((t, k) => t + num(p[k]), 0);
 // Pesanan yang perlu dikoreksi: sudah ditandai cair tetapi angkanya estimasi (versi lama), atau dibatalkan setelah dicatat
 const needsFix = (o) => (!!o.cair && !o.kas_final) || (!!o.kas_final && isCancelled(o.status));
 const applySku = (it, skuId, skus) => {
@@ -399,6 +445,8 @@ const buildPreview = (rows, skus, biayaPct) => {
   const cQty = findCol(cols, "jumlah", "quantity");
   const cNilai = findCol(cols, "subtotal pesanan", "subtotal", "total pembayaran", "total");
   const cKirim = findCol(cols, "waktu pengiriman diatur", "waktu pesanan dibuat", "waktu pembayaran");
+  const cVoucher = findCol(cols, "voucher ditanggung penjual", "voucher toko");
+  const seenOrders = new Set();
   if (!cProduct) throw new Error("Format file tidak dikenali. Pastikan ada kolom Nama Produk.");
   const toDateStr = (v) => {
     if (!v) return "";
@@ -417,8 +465,12 @@ const buildPreview = (rows, skus, biayaPct) => {
     const nilai = cNilai ? parseNum(row[cNilai]) : 0;
     const biaya = Math.round(nilai * (num(biayaPct) / 100));
     const m = matchSku(fullName, skus);
+    const orderNo = cOrder ? String(row[cOrder] ?? "").trim() : "";
+    let voucher = 0;
+    if (cVoucher && orderNo && !seenOrders.has(orderNo)) voucher = Math.abs(parseNum(row[cVoucher]));
+    if (orderNo) seenOrders.add(orderNo);
     items.push({
-      order_no: cOrder ? String(row[cOrder] ?? "").trim() : "",
+      order_no: orderNo, voucher,
       product_name: product, variation, qty, nilai, biaya,
       pendapatan_akhir: nilai - biaya,
       status: cStatus ? String(row[cStatus] ?? "").trim() : "",
@@ -538,11 +590,12 @@ async function processShopee(items, skus, orders, actor) {
       const locked = !!existing.kas_final;   // angka akhir sudah dicatat: jangan ditimpa estimasi
       const nilai = locked ? existing.nilai : item.nilai;
       const biaya = locked ? existing.biaya : item.biaya;
+      const voucher = locked ? num(existing.voucher) : item.voucher > 0 ? item.voucher : num(existing.voucher);
       const incoming = {
-        status: item.status || existing.status, nilai, biaya, qty: item.qty,
+        status: item.status || existing.status, nilai, biaya, qty: item.qty, voucher,
         sku_id: item.sku_id, shopee_title: raw, variation: item.variation, tanggal_kirim: item.tanggal_kirim
       };
-      const cmp = { ...existing, shopee_title: existing.shopee_title ?? existing.product_name };
+      const cmp = { ...existing, shopee_title: existing.shopee_title ?? existing.product_name, voucher: num(existing.voucher) };
       if (Object.keys(incoming).every((f) => same(cmp[f], incoming[f]))) { ignored++; continue; }
       const upd = { ...incoming, product_name: display, pendapatan_akhir: nilai - biaya };
       if (item.tgl_update) upd.tgl_update = item.tgl_update;
@@ -555,7 +608,7 @@ async function processShopee(items, skus, orders, actor) {
       const id = newId("so");
       const doc_ = {
         id, channel: ch, order_no: item.order_no, item_id: item.item_id || "", product_name: display, shopee_title: raw,
-        variation: item.variation || "", qty: item.qty, nilai: item.nilai, biaya: item.biaya,
+        variation: item.variation || "", qty: item.qty, nilai: item.nilai, biaya: item.biaya, voucher: num(item.voucher),
         pendapatan_akhir: item.pendapatan_akhir || (item.nilai - item.biaya),
         status: item.status || "Selesai", tanggal_kirim: item.tanggal_kirim || "",
         tanggal_cair: "", cair: false, kas_final: false, sku_id: item.sku_id || null,
@@ -579,6 +632,7 @@ async function updateShopeeOrder(o, payload, actor) {
     u.nilai = num(payload.nilai);
     u.pendapatan_akhir = u.nilai - num(o.biaya);
   }
+  if (!o.kas_final && payload.voucher !== undefined && payload.voucher !== null) u.voucher = Math.max(0, num(payload.voucher));
   if (!Object.keys(u).length) return;
   await updateDoc(ref("shopee_orders", o.id), u);
   await applyOrderEffects({ ...o, ...u }, actor);
@@ -920,7 +974,7 @@ const Dashboard = ({ d }) => {
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <${KpiCard} icon="wallet" label="Total Saldo BAC Cash" value=${fmtRp(stats.saldo)} accent="bg-sky-500/10 text-sky-400" sub=${`${fmtRp(stats.total_pemasukan)} masuk (periode)`} />
         <${KpiCard} icon="bag" label="Penghasilan Diterima" value=${fmtRp(stats.shopee_revenue)} accent="bg-orange-500/10 text-orange-500" sub="Angka akhir yang sudah dicatat" />
-        <${KpiCard} icon="clock" label="Belum Cair (nilai kotor)" value=${fmtRp(stats.shopee_belum_cair)} accent="bg-amber-500/10 text-amber-400" sub="Sebelum potongan marketplace" />
+        <${KpiCard} icon="clock" label="Belum Cair (perkiraan bersih)" value=${"~" + fmtRp(stats.shopee_belum_cair)} accent="bg-amber-500/10 text-amber-400" sub=${`nilai kotor ${fmtRp(stats.shopee_belum_gross)}`} />
         <${KpiCard} icon="alert" label="Stok Kritis" value=${stats.critical_count} accent="bg-rose-500/10 text-rose-400" sub=${`${stats.total_skus} SKU · nilai ${fmtRp(stats.stock_value)}`} />
       </div>
 
@@ -1365,7 +1419,6 @@ const ImportTab = ({ d }) => {
   const [biayaPct, setBiayaPct] = useState(0);
   const input = useRef(null);
 
-  useEffect(() => { if (d.settings && d.settings.shopee_biaya_pct !== undefined) setBiayaPct(num(d.settings.shopee_biaya_pct)); }, [d.settings?.shopee_biaya_pct]);
 
   const preview = useMemo(() => {
     if (!rows) return null;
@@ -1408,10 +1461,8 @@ const ImportTab = ({ d }) => {
 
   return html`<div>
     <div class="flex flex-col sm:flex-row items-stretch sm:items-end justify-between gap-3 mb-4">
-      <p class="text-sm text-muted-foreground max-w-md">Upload laporan Shopee. Sistem mengecek <b>No. Pesanan</b>: data baru ditambah, status yang berubah diperbarui (stok ikut menyesuaikan), duplikat diabaikan. <b>Kas tidak dicatat dari impor</b>: angka akhir diisi di tab Monitoring.</p>
+      <p class="text-sm text-muted-foreground max-w-md">Upload laporan Shopee. Sistem mengecek <b>No. Pesanan</b>: data baru ditambah, status yang berubah diperbarui (stok ikut menyesuaikan), duplikat diabaikan. <b>Kas tidak dicatat dari impor</b>: angka akhir diisi di tab Monitoring. Perkiraan potongan diatur di tab Monitoring (tombol Atur estimasi).</p>
       <div class="flex items-end gap-2">
-        <div><${Lbl}>Est. Biaya Shopee (%)<//><${Inp} type="number" inputmode="decimal" value=${biayaPct} onInput=${(e) => setBiayaPct(Number(e.target.value))} cls="!w-24 !h-9 font-mono" /></div>
-        <${Btn} variant="outline" onClick=${saveDefault} cls="!h-9 !px-3" aria-label="Simpan sebagai default"><${Icon} name="save" /><//>
         <${Btn} variant="outline" onClick=${downloadSample} cls="!h-9"><${Icon} name="download" /> Contoh<//>
       </div>
     </div>
@@ -1459,26 +1510,39 @@ const ImportTab = ({ d }) => {
   </div>`;
 };
 
-const FinalDialog = ({ rows, onClose, actor }) => {
+const PART_FIELDS = [
+  ["voucher", "Voucher toko (ditanggung penjual)"],
+  ["admin", "Biaya administrasi"],
+  ["proses", "Biaya proses pesanan"],
+  ["xtra", "Biaya Gratis Ongkir XTRA"],
+  ["pph", "PPh 22"],
+  ["ams", "Biaya promosi (komisi AMS, dll)"],
+  ["lain", "Potongan lain"]
+];
+
+const FinalDialog = ({ rows, onClose, actor, cfg }) => {
   const first = rows[0];
   const live = rows.filter((r) => !isCancelled(r.status));
   const nilai = sum(live, (r) => r.nilai);
   const done = live.length > 0 && live.every((r) => r.kas_final);
   const legacy = live.some((r) => r.cair && !r.kas_final);
-  const [mode, setMode] = useState("final");
+  const est = useMemo(() => estimateOrder(rows, cfg), []);
+  const z = (n) => (n ? String(n) : "");
+  const [mode, setMode] = useState(done || legacy ? "final" : "parts");
   const [fin, setFin] = useState(done ? String(Math.round(sum(live, (r) => r.pendapatan_akhir))) : "");
-  const [c1, setC1] = useState("");
-  const [c2, setC2] = useState("");
-  const [c3, setC3] = useState("");
+  const [parts, setParts] = useState({ voucher: z(est.voucher), admin: z(est.admin), proses: z(est.proses), xtra: z(est.xtra), pph: z(est.pph), ams: z(est.ams), lain: "" });
+  const [ok, setOk] = useState(false);
   const [date, setDate] = useState(done || legacy ? (first.tanggal_cair || todayStr()) : todayStr());
   const [busy, setBusy] = useState(false);
-  const total = mode === "final" ? Number(fin) || 0 : nilai - (Number(c1) || 0) - (Number(c2) || 0) - (Number(c3) || 0);
+  const total = mode === "final" ? Number(fin) || 0 : netFromParts(nilai, parts);
   const potongan = nilai - total;
   const pct = nilai > 0 ? (potongan / nilai) * 100 : 0;
+  const diff = total - est.net;
   const warn = !(total > 0) ? "" : total > nilai ? "Lebih besar dari nilai pesanan." : pct > 40 ? "Potongan lebih dari 40% dari nilai pesanan." : "";
 
   const save = async () => {
     if (!(total > 0)) { toast("Isi penghasilan akhir lebih dari 0", "err"); return; }
+    if (mode === "parts" && !ok) { toast("Centang dulu: setiap baris sudah dicocokkan dengan Rincian Penghasilan", "err"); return; }
     if (warn && !confirm(`${warn}\n\nTetap catat ${fmtRp(total)} ke kas?`)) return;
     setBusy(true);
     try { await recordFinal(rows, total, date, actor); toast(`Tercatat di kas: ${fmtRp(total)}`); onClose(); }
@@ -1503,8 +1567,8 @@ const FinalDialog = ({ rows, onClose, actor }) => {
       </div>
 
       <div class="inline-flex rounded-md border border-[#262F40] overflow-hidden text-xs">
-        <button onClick=${() => setMode("final")} class=${cx("px-3 py-1.5", mode === "final" ? "bg-sky-500/20 text-sky-300" : "text-muted-foreground")}>Isi angka akhir</button>
-        <button onClick=${() => setMode("parts")} class=${cx("px-3 py-1.5", mode === "parts" ? "bg-sky-500/20 text-sky-300" : "text-muted-foreground")}>Hitung dari potongan</button>
+        <button onClick=${() => setMode("parts")} class=${cx("px-3 py-1.5", mode === "parts" ? "bg-sky-500/20 text-sky-300" : "text-muted-foreground")}>Cocokkan per baris</button>
+        <button onClick=${() => setMode("final")} class=${cx("px-3 py-1.5", mode === "final" ? "bg-sky-500/20 text-sky-300" : "text-muted-foreground")}>Ketik angka akhir</button>
       </div>
 
       ${mode === "final"
@@ -1512,16 +1576,21 @@ const FinalDialog = ({ rows, onClose, actor }) => {
             <${Inp} type="number" inputmode="numeric" value=${fin} onInput=${(e) => setFin(e.target.value)} placeholder="mis. 308950" cls="font-mono !h-12 text-lg" autofocus />
           </div>`
         : html`<div class="space-y-2">
-            <div><${Lbl}>Biaya platform / komisi<//><${Inp} type="number" inputmode="numeric" value=${c1} onInput=${(e) => setC1(e.target.value)} cls="font-mono" /></div>
-            <div><${Lbl}>Biaya ongkir / program (mis. Gratis Ongkir XTRA)<//><${Inp} type="number" inputmode="numeric" value=${c2} onInput=${(e) => setC2(e.target.value)} cls="font-mono" /></div>
-            <div><${Lbl}>Potongan lain<//><${Inp} type="number" inputmode="numeric" value=${c3} onInput=${(e) => setC3(e.target.value)} cls="font-mono" /></div>
+            <p class="text-xs text-amber-300">Angka di bawah baru perkiraan sistem. Cocokkan tiap baris dengan Rincian Penghasilan di Shopee, ubah yang berbeda (kosongkan jika Rp0).</p>
+            <div class="grid grid-cols-2 gap-2">
+              ${PART_FIELDS.map(([k, label]) => html`<div key=${k}><${Lbl}>${label}<//><${Inp} type="number" inputmode="numeric" value=${parts[k]} onInput=${(e) => setParts({ ...parts, [k]: e.target.value })} cls="font-mono" placeholder="0" /></div>`)}
+            </div>
           </div>`}
 
       <div class="rounded-md border border-[#262F40] p-3 text-sm space-y-1">
-        <div class="flex justify-between"><span class="text-muted-foreground">Potongan marketplace</span><span class="font-mono text-rose-400">${total > 0 ? fmtRp(potongan) : "-"}${total > 0 ? ` (${pct.toFixed(1)}%)` : ""}</span></div>
+        <div class="flex justify-between"><span class="text-muted-foreground">Perkiraan sistem</span><span class="font-mono text-amber-300">~${fmtRp(est.net)}</span></div>
+        <div class="flex justify-between"><span class="text-muted-foreground">Potongan</span><span class="font-mono text-rose-400">${total > 0 ? fmtRp(potongan) + ` (${pct.toFixed(1)}%)` : "-"}</span></div>
         <div class="flex justify-between"><span class="text-muted-foreground">Dicatat ke kas</span><span class="font-mono font-bold text-emerald-400">${total > 0 ? fmtRp(total) : "-"}</span></div>
+        ${total > 0 && diff !== 0 && html`<div class="flex justify-between"><span class="text-muted-foreground">Selisih dari perkiraan</span><span class=${cx("font-mono", Math.abs(diff) > 0.01 * nilai ? "text-amber-300" : "text-slate-300")}>${diff > 0 ? "+" : ""}${fmtRp(diff)}</span></div>`}
       </div>
       ${warn && html`<p class="text-xs text-amber-300">${warn} Periksa lagi angkanya sebelum menyimpan.</p>`}
+
+      ${mode === "parts" && html`<label class="flex items-start gap-2 text-xs text-slate-300"><input type="checkbox" checked=${ok} onChange=${(e) => setOk(e.target.checked)} class="mt-0.5 w-4 h-4" /> <span>Saya sudah mencocokkan setiap baris dengan Rincian Penghasilan di Shopee</span></label>`}
 
       <div><${Lbl}>Tanggal cair (tanggal tercatat di kas)<//><${Inp} type="date" value=${date} onInput=${(e) => setDate(e.target.value)} /></div>
       <${Btn} onClick=${save} disabled=${busy} cls="w-full !h-12">${busy ? html`<${Spinner} />` : null} Simpan dan catat ke kas<//>
@@ -1530,22 +1599,58 @@ const FinalDialog = ({ rows, onClose, actor }) => {
   <//>`;
 };
 
+const FeeSettings = ({ cfg, onClose }) => {
+  const [f, setF] = useState({ admin: String(cfg.admin), xtra: String(cfg.xtra), pph: String(cfg.pph), proses: String(cfg.proses), ams: String(cfg.ams) });
+  const [busy, setBusy] = useState(false);
+  const fields = [
+    ["admin", "Biaya administrasi (%)"],
+    ["xtra", "Gratis Ongkir XTRA (%)"],
+    ["pph", "PPh 22 (%)"],
+    ["ams", "Komisi AMS / promosi (%)"],
+    ["proses", "Biaya proses per pesanan (Rp)"]
+  ];
+  const save = async () => {
+    setBusy(true);
+    try {
+      await saveSettings({ fee_admin: Number(f.admin) || 0, fee_xtra: Number(f.xtra) || 0, fee_pph: Number(f.pph) || 0, fee_ams: Number(f.ams) || 0, fee_proses: Number(f.proses) || 0 });
+      toast("Pengaturan estimasi tersimpan"); onClose();
+    } catch (e) { toast("Gagal menyimpan", "err"); }
+    finally { setBusy(false); }
+  };
+  const reset = () => setF({ admin: String(DEFAULT_FEE.admin), xtra: String(DEFAULT_FEE.xtra), pph: String(DEFAULT_FEE.pph), proses: String(DEFAULT_FEE.proses), ams: String(DEFAULT_FEE.ams) });
+  const sample = estimateOrder([{ nilai: 188000, voucher: 0, status: "Selesai" }], { admin: Number(f.admin) || 0, xtra: Number(f.xtra) || 0, pph: Number(f.pph) || 0, ams: Number(f.ams) || 0, proses: Number(f.proses) || 0 });
+  return html`<${Modal} open=${true} onClose=${onClose} title="Atur estimasi potongan Shopee">
+    <div class="space-y-3">
+      <p class="text-xs text-muted-foreground">Perkiraan = nilai - voucher toko - (nilai - voucher) x persen - biaya proses. Hanya untuk tampilan. Kas tetap hanya dari angka akhir yang Anda catat.</p>
+      <div class="grid grid-cols-2 gap-2">
+        ${fields.map(([k, label]) => html`<div key=${k}><${Lbl}>${label}<//><${Inp} type="number" inputmode="decimal" value=${f[k]} onInput=${(e) => setF({ ...f, [k]: e.target.value })} cls="font-mono" /></div>`)}
+      </div>
+      <p class="text-xs rounded-md bg-[#0B0F17] border border-[#262F40] p-2.5">Contoh pesanan Rp188.000 tanpa voucher: potongan ${fmtRp(sample.potongan)}, perkiraan diterima <span class="font-mono text-amber-300">~${fmtRp(sample.net)}</span></p>
+      <div class="flex gap-2">
+        <${Btn} onClick=${save} disabled=${busy} cls="flex-1">Simpan<//>
+        <${Btn} variant="outline" onClick=${reset}>Kembalikan default<//>
+      </div>
+    </div>
+  <//>`;
+};
+
 const MonitoringTab = ({ d }) => {
   const [edit, setEdit] = useState(null);
   const [finKey, setFinKey] = useState(null);
+  const [cfgOpen, setCfgOpen] = useState(false);
   const [statusFilter, setStatusFilter] = useState("all");
   const [q, setQ] = useState("");
 
+  const cfg = useMemo(() => getFeeCfg(d.settings), [d.settings]);
+  const est = useMemo(() => estimateRows(d.orders, cfg), [d.orders, cfg]);
+  const unpaid = useMemo(() => estimateUnpaid(d.orders, cfg), [d.orders, cfg]);
   const skuCode = useMemo(() => Object.fromEntries(d.skus.map((s) => [s.id, s.code])), [d.skus]);
   const orders = useMemo(() => d.orders.map((o) => ({ ...o, sku_code: o.sku_id ? skuCode[o.sku_id] || null : null })), [d.orders, skuCode]);
   const live = orders.filter((o) => !isCancelled(o.status));
-  const belum = live.filter((o) => !o.cair);
   const totals = {
     nilai: sum(live, (o) => o.nilai),
     biaya: sum(orders.filter((o) => o.kas_final), (o) => o.biaya),
     diterima: sum(orders.filter((o) => o.cair), (o) => o.pendapatan_akhir),
-    belumNilai: sum(belum, (o) => o.nilai),
-    belumCount: belum.length,
     fix: orders.filter(needsFix).length
   };
   const filtered = orders.filter((o) => {
@@ -1568,15 +1673,15 @@ const MonitoringTab = ({ d }) => {
   const saveEdit = async () => {
     const base = d.orders.find((x) => x.id === edit.id) || edit;
     try {
-      await updateShopeeOrder(base, { status: edit.status, nilai: Number(edit.nilai) || 0 }, d.actor);
+      await updateShopeeOrder(base, { status: edit.status, nilai: Number(edit.nilai) || 0, voucher: Number(edit.voucher) || 0 }, d.actor);
       setEdit(null); toast("Pesanan diperbarui");
     } catch (e) { toast("Gagal menyimpan", "err"); }
   };
   const exportAs = (fmt) => {
-    const headers = ["No. Pesanan", "Channel", "Produk", "SKU", "Tgl Kirim", "Tgl Cair", "Nilai", "Status", "Potongan (final)", "Penghasilan Akhir (final)", "Pencatatan"];
+    const headers = ["No. Pesanan", "Channel", "Produk", "SKU", "Tgl Kirim", "Tgl Cair", "Nilai", "Status", "Potongan (final)", "Penghasilan Akhir (final)", "Perkiraan Penghasilan (belum final)", "Pencatatan"];
     const rows = orders.map((o) => [o.order_no || "", chanOf(o), o.product_name || "", o.sku_code || "", o.tanggal_kirim || "", o.tanggal_cair || "", num(o.nilai), o.status || "",
-      o.kas_final ? num(o.biaya) : "", o.kas_final ? num(o.pendapatan_akhir) : "", needsFix(o) ? "Perlu koreksi" : o.kas_final ? "Final" : "Belum"]);
-    rows.push(["TOTAL", "", "", "", "", "", totals.nilai, "", totals.biaya, totals.diterima, ""]);
+      o.kas_final ? num(o.biaya) : "", o.kas_final ? num(o.pendapatan_akhir) : "", est.get(o.id) ? est.get(o.id).net : "", needsFix(o) ? "Perlu koreksi" : o.kas_final ? "Final" : "Belum"]);
+    rows.push(["TOTAL", "", "", "", "", "", totals.nilai, "", totals.biaya, totals.diterima, unpaid.net, ""]);
     const name = `Monitoring_Penjualan_${todayStr()}`;
     try {
       if (fmt === "csv") downloadCsv(headers, rows, name + ".csv"); else downloadXlsx(headers, rows, "Monitoring Penjualan", name + ".xlsx");
@@ -1592,7 +1697,7 @@ const MonitoringTab = ({ d }) => {
       <div class="bg-[#161B26] border border-[#262F40] rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Nilai Pesanan (tanpa batal)</p><p class="font-mono text-lg font-bold break-words">${fmtRp(totals.nilai)}</p></div>
       <div class="bg-[#161B26] border-l-4 border-rose-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Potongan Marketplace (final)</p><p class="font-mono text-lg font-bold text-rose-400 break-words">${fmtRp(totals.biaya)}</p></div>
       <div class="bg-[#161B26] border-l-4 border-emerald-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Penghasilan Diterima</p><p class="font-mono text-lg font-bold text-emerald-400 break-words">${fmtRp(totals.diterima)}</p></div>
-      <div class="bg-[#161B26] border-l-4 border-amber-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Belum Cair</p><p class="font-mono text-lg font-bold text-amber-400">${totals.belumCount} pesanan</p><p class="text-[10px] text-muted-foreground">nilai kotor ${fmtRp(totals.belumNilai)}</p></div>
+      <div class="bg-[#161B26] border-l-4 border-amber-500 rounded-lg p-3"><p class="text-[10px] text-muted-foreground">Belum Cair (perkiraan bersih)</p><p class="font-mono text-lg font-bold text-amber-400 break-words">~${fmtRp(unpaid.net)}</p><p class="text-[10px] text-muted-foreground">${unpaid.count} pesanan · nilai kotor ${fmtRp(unpaid.gross)}</p></div>
     </div>
 
     <div class="flex flex-col sm:flex-row sm:items-center gap-3 mb-3">
@@ -1605,7 +1710,10 @@ const MonitoringTab = ({ d }) => {
         <span class="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"><${Icon} name="search" /></span>
         <${Inp} value=${q} onInput=${(e) => setQ(e.target.value)} placeholder="Cari No. Pesanan / SKU / nama..." cls="!pl-9 !h-9" />
       </div>
-      <${Menu} label="Ekspor Monitoring" icon="download" items=${[{ label: "Excel (.xlsx)", onClick: () => exportAs("xlsx") }, { label: "CSV", onClick: () => exportAs("csv") }]} />
+      <div class="flex gap-2">
+        <${Btn} variant="outline" onClick=${() => setCfgOpen(true)} cls="!h-9 flex-1 sm:flex-none"><${Icon} name="settings" /> Atur estimasi<//>
+        <${Menu} label="Ekspor" icon="download" items=${[{ label: "Excel (.xlsx)", onClick: () => exportAs("xlsx") }, { label: "CSV", onClick: () => exportAs("csv") }]} />
+      </div>
     </div>
 
     <div class="bg-[#161B26] border border-[#262F40] rounded-lg overflow-hidden">
@@ -1618,7 +1726,9 @@ const MonitoringTab = ({ d }) => {
           </tr></thead>
           <tbody>
             ${filtered.length === 0 && html`<tr><td colspan="8" class="text-center text-muted-foreground py-8">Belum ada pesanan. Buka tab Import Laporan untuk memasukkan laporan marketplace.</td></tr>`}
-            ${filtered.map((o) => html`<tr key=${o.id} class=${cx("border-t border-[#262F40] border-l-4", needsFix(o) ? "border-l-rose-500" : o.kas_final ? "border-l-emerald-500" : "border-l-amber-500")}>
+            ${filtered.map((o) => {
+              const e = est.get(o.id);
+              return html`<tr key=${o.id} class=${cx("border-t border-[#262F40] border-l-4", needsFix(o) ? "border-l-rose-500" : o.kas_final ? "border-l-emerald-500" : "border-l-amber-500")}>
               <td class="px-3 py-2.5">
                 <span class="font-mono text-xs text-sky-400">${o.order_no}</span>
                 <span class="ml-1 text-[9px] px-1 py-0.5 rounded bg-white/5 text-muted-foreground">${chanOf(o)}</span>
@@ -1630,21 +1740,22 @@ const MonitoringTab = ({ d }) => {
               <td class="px-3 py-2.5 font-mono text-xs text-emerald-300 whitespace-nowrap">${o.tanggal_cair ? fmtDate(o.tanggal_cair) : "-"}</td>
               <td class="px-3 py-2.5 text-right font-mono whitespace-nowrap">${fmtNum(o.nilai)}</td>
               <td class="px-3 py-2.5 text-center"><span class=${cx("text-[10px] px-2 py-0.5 rounded border whitespace-nowrap", statusColor(o.status))}>${o.status}</span></td>
-              <td class="px-3 py-2.5 text-right font-mono text-rose-400 whitespace-nowrap">${o.kas_final ? fmtNum(o.biaya) : "-"}</td>
+              <td class="px-3 py-2.5 text-right font-mono whitespace-nowrap">${o.kas_final ? html`<span class="text-rose-400">${fmtNum(o.biaya)}</span>` : e ? html`<span class="text-rose-300/70">~${fmtNum(e.potongan)}</span>` : "-"}</td>
               <td class="px-3 py-2.5 text-right whitespace-nowrap">
                 ${isCancelled(o.status) && !o.kas_final ? html`<span class="text-muted-foreground">-</span>`
                   : o.kas_final ? html`<button onClick=${() => setFinKey(groupKeyOf(o))} class="font-mono font-bold text-emerald-400 hover:underline">${fmtNum(o.pendapatan_akhir)}</button>`
                   : o.cair ? html`<button onClick=${() => setFinKey(groupKeyOf(o))} class="text-[11px] px-2 py-1 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10">Koreksi</button>`
-                  : html`<button onClick=${() => setFinKey(groupKeyOf(o))} class="text-[11px] px-2 py-1 rounded border border-amber-500/50 text-amber-300 hover:bg-amber-500/10">Isi angka</button>`}
+                  : html`<button onClick=${() => setFinKey(groupKeyOf(o))} class="font-mono text-[12px] px-2 py-1 rounded border border-dashed border-amber-500/50 text-amber-300 hover:bg-amber-500/10" title="Perkiraan, belum final. Ketuk untuk mencocokkan.">~${fmtNum(e ? e.net : 0)}</button>`}
               </td>
               <td class="px-3 py-2.5">
                 <div class="flex items-center justify-center gap-1">
                   <button onClick=${() => setFinKey(groupKeyOf(o))} title="Penghasilan akhir" aria-label="Penghasilan akhir" class=${cx("w-8 h-8 rounded flex items-center justify-center", o.kas_final ? "bg-emerald-500/20 text-emerald-400" : "bg-amber-500/10 text-amber-400 hover:bg-amber-500/20")}><${Icon} name=${o.kas_final ? "cash" : "clock"} cls="w-4 h-4" /></button>
-                  <button onClick=${() => setEdit({ ...o })} aria-label="Edit pesanan" class="w-8 h-8 rounded flex items-center justify-center text-muted-foreground hover:bg-white/10"><${Icon} name="edit" cls="w-3.5 h-3.5" /></button>
+                  <button onClick=${() => setEdit({ ...o, voucher: o.voucher || 0 })} aria-label="Edit pesanan" class="w-8 h-8 rounded flex items-center justify-center text-muted-foreground hover:bg-white/10"><${Icon} name="edit" cls="w-3.5 h-3.5" /></button>
                   <button onClick=${() => remove(o)} aria-label="Hapus pesanan" class="w-8 h-8 rounded flex items-center justify-center text-muted-foreground hover:bg-rose-500/10 hover:text-rose-400"><${Icon} name="trash" cls="w-3.5 h-3.5" /></button>
                 </div>
               </td>
-            </tr>`)}
+            </tr>`;
+            })}
           </tbody>
           ${orders.length > 0 && html`<tfoot class="bg-[#0F1420] font-mono font-bold border-t-2 border-[#262F40]"><tr>
             <td class="px-3 py-2.5 text-xs" colspan="3">TOTAL (${orders.length} baris)</td>
@@ -1655,9 +1766,10 @@ const MonitoringTab = ({ d }) => {
         </table>
       </div>
     </div>
-    <p class="text-[11px] text-muted-foreground mt-2">Penghasilan Akhir hanya terisi setelah Anda memasukkannya. Angka itulah yang masuk ke Buku Kas, tidak pernah hasil tebakan sistem.</p>
+    <p class="text-[11px] text-muted-foreground mt-2">Angka berawalan ~ adalah perkiraan sistem (garis putus-putus), belum masuk kas. Penghasilan Akhir baru tercatat setelah Anda mencocokkan dan menyimpannya.</p>
 
-    ${finRows.length > 0 && html`<${FinalDialog} key=${finKey} rows=${finRows} onClose=${() => setFinKey(null)} actor=${d.actor} />`}
+    ${finRows.length > 0 && html`<${FinalDialog} key=${finKey} rows=${finRows} cfg=${cfg} onClose=${() => setFinKey(null)} actor=${d.actor} />`}
+    ${cfgOpen && html`<${FeeSettings} cfg=${cfg} onClose=${() => setCfgOpen(false)} />`}
 
     <${Modal} open=${!!edit} onClose=${() => setEdit(null)} title=${`Edit Pesanan ${edit ? edit.order_no : ""}`}>
       ${edit && html`<div class="space-y-3">
@@ -1668,9 +1780,11 @@ const MonitoringTab = ({ d }) => {
         </div>
         <div><${Lbl}>Nilai pesanan<//>
           <${Inp} type="number" inputmode="numeric" value=${edit.nilai} onInput=${(e) => setEdit({ ...edit, nilai: e.target.value })} disabled=${!!edit.kas_final} cls="font-mono" />
-          ${edit.kas_final && html`<p class="text-[11px] text-muted-foreground mt-1">Nilai dikunci karena penghasilan akhir sudah dicatat. Batalkan pencatatan dulu jika perlu mengubahnya.</p>`}
         </div>
-        <p class="text-xs text-muted-foreground">Potongan dan Penghasilan Akhir diisi lewat tombol jam/uang pada baris pesanan.</p>
+        <div><${Lbl}>Voucher toko (ditanggung penjual), untuk perkiraan<//>
+          <${Inp} type="number" inputmode="numeric" value=${edit.voucher} onInput=${(e) => setEdit({ ...edit, voucher: e.target.value })} disabled=${!!edit.kas_final} cls="font-mono" />
+        </div>
+        ${edit.kas_final && html`<p class="text-[11px] text-muted-foreground">Nilai dan voucher dikunci karena penghasilan akhir sudah dicatat. Batalkan pencatatan dulu jika perlu mengubahnya.</p>`}
         <${Btn} onClick=${saveEdit} cls="w-full">Simpan<//>
       </div>`}
     <//>
